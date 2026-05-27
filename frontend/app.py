@@ -228,7 +228,7 @@ def page_jobs():
                 if st.button("View", key=f"view_{unique_key}"):
                     st.session_state["selected_job_url"] = url
                     st.session_state["_selected_key"] = unique_key
-                    st.switch_page("__main__")
+                    st.rerun()
             st.divider()
 
 # ── Page: Job Detail ─────────────────────────────────────────────────────────
@@ -528,7 +528,7 @@ def page_settings():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    # Navigation
+    # Navigate
     pages = {
         "📊 Dashboard": page_dashboard,
         "💼 Jobs": page_jobs,
@@ -536,10 +536,6 @@ def main():
         "⚙️ Pipeline": page_pipeline,
         "⚙️ Settings": page_settings,
     }
-
-    # Auto-switch to job detail if we have a selected job
-    if st.session_state.get("selected_job_url") and st.query_params.get("page") != "jobs":
-        st.switch_page(page_job_detail)
 
     st.sidebar.title("🎯 ApplyPilot")
     st.sidebar.caption("AI-powered job application automation")
