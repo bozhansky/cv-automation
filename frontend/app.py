@@ -1,5 +1,6 @@
 """ApplyPilot Web UI — Streamlit frontend for the job application pipeline."""
 
+import hashlib
 import io
 import os
 import sys
@@ -223,8 +224,10 @@ def page_jobs():
                 st.caption(tailored)
                 st.caption(cover)
             with cols[3]:
-                if st.button("View", key=f"view_{url[:30]}"):
+                unique_key = hashlib.sha1(url.encode()).hexdigest()[:12]
+                if st.button("View", key=f"view_{unique_key}"):
                     st.session_state["selected_job_url"] = url
+                    st.session_state["_selected_key"] = unique_key
                     st.switch_page("__main__")
             st.divider()
 
@@ -345,8 +348,9 @@ def page_job_detail():
             if job.get("application_url"):
                 st.markdown(f"**Apply at:** [{job['application_url'][:80]}]({job['application_url']})")
 
-            if st.button("🚀 Submit Application", type="primary"):
-                st.info("Auto-apply with Ollama agent is not yet built. The application URL is ready for manual application.")
+        if st.button("🚀 Submit Application", type="primary", key=f"apply_{st.session_state.get('_selected_key','x')}"):
+            st.session_state["applied_clicked"] = True
+            st.rerun()
 
 # ── Page: Pipeline ───────────────────────────────────────────────────────────
 
