@@ -226,8 +226,7 @@ def page_jobs():
             with cols[3]:
                 unique_key = hashlib.sha1(url.encode()).hexdigest()[:12]
                 if st.button("View", key=f"view_{unique_key}"):
-                    st.session_state["selected_job_url"] = url
-                    st.session_state["_selected_key"] = unique_key
+                    st.query_params["job"] = url
                     st.rerun()
             st.divider()
 
@@ -239,8 +238,6 @@ def page_job_detail():
     selected = st.session_state.get("selected_job_url")
     if not selected:
         st.info("No job selected. Go to the Jobs page and click 'View' on a job.")
-        if st.button("← Go to Jobs"):
-            st.switch_page("__main__")
         return
 
     conn = get_connection()
@@ -528,7 +525,19 @@ def page_settings():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    # Navigate
+    # Handle navigation from job detail deep links
+    # "?page=job_detail&job=<url-hash>" set by clicking "View" on a job
+    job_param = st.query_params.get("job")
+    if job_param:
+        st.session_state["_nav"] = "📋 Job Detail"
+        st.session_state["selected_job_url"] = job_param
+        st.session_state["_selected_key"] = hashlib.sha1(job_param.encode()).hexdigest()[:12]
+        # Clear the query param so refresh doesn't re-trigger
+        st.query_params.pop("job")
+    else:
+        if "_nav" not in st.session_state:
+            st.session_state["_nav"] = "📊 Dashboard"
+
     pages = {
         "📊 Dashboard": page_dashboard,
         "💼 Jobs": page_jobs,
@@ -540,10 +549,18 @@ def main():
     st.sidebar.title("🎯 ApplyPilot")
     st.sidebar.caption("AI-powered job application automation")
 
-    selection = st.sidebar.radio("Navigate", list(pages.keys()), index=0)
+    # Pre-select Job Detail if we came from the jobs page
+    if st.session_state.get("selected_job_url") and st.session_state.get("_nav") == "📋 Job Detail":
+        default_idx = list(pages.keys()).index("📋 Job Detail")
+    else:
+        default_idx = list(pages.keys()).index(st.session_state.get("_nav", "📊 Dashboard"))
+
+    selection = st.sidebar.radio("Navigate", list(pages.keys()), index=default_idx, key="_nav_radio")
+    st.session_state["_nav"] = selection
 
     if selection == "📋 Job Detail" and not st.session_state.get("selected_job_url"):
         selection = "📊 Dashboard"
+        st.session_state["_nav"] = "📊 Dashboard"
 
     pages[selection]()
 
