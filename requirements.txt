@@ -1,0 +1,3 @@
+streamlit>=1.30.0
+applypilot>=0.3.0
+python-jobspy>=1.1.0

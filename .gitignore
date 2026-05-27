@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# ApplyPilot runtime output (keep source files, exclude generated)
+applypilot.db
+applypilot.db-shm
+applypilot.db-wal
+apply-workers/
+chrome-workers/
+cover_letters/
+tailored_resumes/
+logs/
+
+# Node / JavaScript
+node_modules/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment secrets
+.env
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
