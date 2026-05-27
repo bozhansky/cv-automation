@@ -331,7 +331,23 @@ def page_job_detail():
 
     # ── Apply ──────────────────────────────────────────────────────────────
     with tabs[4]:
-        if job.get("applied_at"):
+        applied_key = f"applied_{st.session_state.get('_selected_key','x')}"
+
+        if st.session_state.get("applied_clicked"):
+            import sqlite3
+            from datetime import datetime, timezone
+            conn = get_connection()
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE jobs SET applied_at = ?, apply_status = 'manual_submit_pending' WHERE url = ?",
+                (now, st.session_state.get("selected_job_url", ""))
+            )
+            conn.commit()
+            st.success("✅ Application marked as submitted!")
+            st.info("This records a manual submit. The Ollama auto-apply agent is not yet built.")
+            st.session_state["applied_clicked"] = False
+            st.rerun()
+        elif job.get("applied_at"):
             st.success(f"✅ Applied on {job['applied_at']}")
             if job.get("apply_status"):
                 st.write(f"**Status:** {job['apply_status']}")
@@ -348,9 +364,9 @@ def page_job_detail():
             if job.get("application_url"):
                 st.markdown(f"**Apply at:** [{job['application_url'][:80]}]({job['application_url']})")
 
-        if st.button("🚀 Submit Application", type="primary", key=f"apply_{st.session_state.get('_selected_key','x')}"):
-            st.session_state["applied_clicked"] = True
-            st.rerun()
+            if st.button("🚀 Submit Application", type="primary", key=applied_key):
+                st.session_state["applied_clicked"] = True
+                st.rerun()
 
 # ── Page: Pipeline ───────────────────────────────────────────────────────────
 
