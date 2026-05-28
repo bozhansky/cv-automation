@@ -181,7 +181,7 @@ def page_dashboard():
             with st.container():
                 c1, c2, c3 = st.columns([1, 5, 1])
                 c1.write(score_badge(job.get("fit_score")))
-                c2.markdown(f"**{job.get('title', '?')}**\n{c2.caption(f\"{job.get('site', '')} · {job.get('location', '')}\")}")
+                c2.markdown(f"**{job.get('title', '?')}**\n{job.get('site', '')} · {job.get('location', '')}")
                 uk = hashlib.sha1((job.get("url") or "").encode()).hexdigest()[:8]
                 if c3.button("Approve", key=f"pend_approve_{uk}"):
                     st.session_state["_pending_approve"] = job.get("url")
