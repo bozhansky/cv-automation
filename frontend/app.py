@@ -172,6 +172,9 @@ def page_dashboard():
 
     st.divider()
     st.subheader("⏳ Pending Your Approval")
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
     pending = conn.execute("""
         SELECT * FROM jobs WHERE apply_status = 'pending_approval' ORDER BY fit_score DESC LIMIT 5
     """).fetchall()
@@ -431,21 +434,31 @@ def page_pipeline():
         ("pdf",       "Export PDF",           "Convert to PDF"),
     ]
 
+    last_rc  = [None]
+    last_out = [None]
+
     for stage, label, desc in stages:
         with st.expander(f"▶ {label} — `{stage}`", expanded=(stage in ["tailor","cover"])):
             st.caption(desc)
-            out, rc = st.columns([4, 1])
-            with out:
+            col_btn, col_rc = st.columns([4, 1])
+            with col_btn:
                 if st.button(f"▶ Run {label}", key=f"run_{stage}"):
                     with st.spinner(f"Running `{stage}`..."):
                         output, rc = run_stage(stage)
-                    st.code(output[-4000:] if len(output) > 4000 else output, language="bash")
-                    if rc == 0:
-                        st.success(f"`{stage}` completed successfully.")
-                    else:
-                        st.error(f"`{stage}` failed (exit {rc}).")
-            with rc:
-                st.write(f"Exit: {rc if 'rc' in dir() else '—'}")
+                    last_out[0] = output[-4000:]
+                    last_rc[0]  = rc
+                    st.rerun()
+            with col_rc:
+                st.write(f"Exit: {last_rc[0] if last_rc[0] is not None else '—'}")
+
+        if last_out[0] is not None and last_rc[0] is not None:
+            with st.expander("Output", expanded=False):
+                st.code(last_out[0], language="bash")
+                if last_rc[0] == 0:
+                    st.success(f"`{stage}` completed successfully.")
+                else:
+                    st.error(f"`{stage}` failed (exit {last_rc[0]}).")
+            last_out[0], last_rc[0] = None, None
 
 def page_settings():
     st.title("⚙️ Settings")
