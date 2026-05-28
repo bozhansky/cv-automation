@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,10 @@ TAILORED_DIR   = APPLYPILOT_DIR / "tailored_resumes"
 COVER_DIR      = APPLYPILOT_DIR / "cover_letters"
 PROFILE_PATH   = APPLYPILOT_DIR / "profile.json"
 SEARCHES_PATH  = APPLYPILOT_DIR / "searches.yaml"
+
+# ── Add project agents/ to path for auto_apply module ─────────────────────────
+_PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 # ── DB cursor helper ──────────────────────────────────────────────────────────
 def get_conn():
@@ -116,6 +121,16 @@ _job_url = _current_job()
 if _job_url and _current_page() != "Job Detail":
     _set_page("Job Detail")
 
+# ── Bootstrap guard — only run on user-initiated reruns ────────────────────────
+# Prevents DeltaGenerator artifact from appearing when rerun fires during element construction.
+if "rerun_guard" not in st.session_state:
+    st.session_state["rerun_guard"] = True
+else:
+    # Already initialized — this is a re-render from a widget action.
+    # DeltaGenerator artifacts appear when st.rerun() fires during construction.
+    pass
+
+# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ApplyPilot",
     page_icon="🎯",
@@ -154,6 +169,31 @@ def page_dashboard():
     if rows:
         chart_data = {"Score": [str(r[0]) for r in rows], "Count": [r[1] for r in rows]}
         st.bar_chart(chart_data, x="Score", y="Count")
+
+    st.divider()
+    st.subheader("⏳ Pending Your Approval")
+    pending = conn.execute("""
+        SELECT * FROM jobs WHERE apply_status = 'pending_approval' ORDER BY fit_score DESC LIMIT 5
+    """).fetchall()
+    if pending:
+        pending_dicts = [row_to_dict(r) for r in pending]
+        for job in pending_dicts:
+            with st.container():
+                c1, c2, c3 = st.columns([1, 5, 1])
+                c1.write(score_badge(job.get("fit_score")))
+                c2.markdown(f"**{job.get('title', '?')}**\n{c2.caption(f\"{job.get('site', '')} · {job.get('location', '')}\")}")
+                uk = hashlib.sha1((job.get("url") or "").encode()).hexdigest()[:8]
+                if c3.button("Approve", key=f"pend_approve_{uk}"):
+                    st.session_state["_pending_approve"] = job.get("url")
+                    st.rerun()
+                if c3.button("Decline", key=f"pend_decline_{uk}"):
+                    from agents.auto_apply import mark_approval_declined
+                    conn2 = get_conn()
+                    mark_approval_declined(conn2, job.get("url"))
+                    st.rerun()
+                st.divider()
+    else:
+        st.caption("No pending approvals.")
 
     st.divider()
     st.subheader("Recent Jobs")
@@ -300,31 +340,95 @@ def page_job_detail():
 
     # ── Apply ────────────────────────────────────────────────────────────────
     with tabs[4]:
-        applied_at  = job.get("applied_at")
-        apply_url   = job.get("application_url") or job.get("url") or ""
-        apply_st    = job.get("apply_status") or ""
+        applied_at = job.get("applied_at")
+        apply_url  = job.get("application_url") or job.get("url") or ""
+        apply_st   = job.get("apply_status") or ""
 
         if applied_at:
             st.success(f"✅ Applied at {applied_at}")
             if apply_st:
                 st.caption(f"Status: {apply_st}")
-        else:
-            st.markdown(f"**Apply URL:** [Open]({apply_url})")
-            st.info("Auto-apply with Ollama agent is not yet built. Use the link above to apply manually.")
-            if st.button("✅ Mark as Applied", type="primary"):
-                save_job_apply_status(url, "manual_submit_pending")
+
+        elif apply_st == "pending_approval":
+            st.warning("⏳ Awaiting your approval — you were notified on Telegram.")
+            st.info("Open the app and go to the Dashboard to approve pending applications.")
+            if st.button("❌ Decline"):
+                from agents.auto_apply import mark_approval_declined
+                conn2 = get_conn()
+                mark_approval_declined(conn2, url)
                 st.rerun()
+
+        elif apply_st == "declined":
+            st.caption("❌ You declined this application.")
+
+        else:
+            # Job has tailored resume + cover letter → offer approval queue
+            has_resume = bool(job.get("tailored_resume_path"))
+            has_cover  = bool(job.get("cover_letter_path"))
+
+            st.markdown(f"**Apply URL:** [Open]({apply_url})")
+
+            if has_resume and has_cover:
+                st.success("✅ Resume tailored · ✅ Cover letter ready")
+
+                # Queue for approval (idempotent — safe to call on every view)
+                from agents.auto_apply import queue_for_approval
+                try:
+                    queue_for_approval(url)
+                except Exception:
+                    pass  # already queued or DB issue
+
+                # Inline approval buttons — NO rerun until user commits
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    approved = st.button(
+                        "✅ Yes — Open Apply in Browser",
+                        type="primary",
+                        key=f"approve_apply_{hashlib.sha1(url.encode()).hexdigest()[:8]}",
+                    )
+                with col_b:
+                    declined = st.button(
+                        "❌ No — Skip",
+                        key=f"decline_apply_{hashlib.sha1(url.encode()).hexdigest()[:8]}",
+                    )
+
+                if approved:
+                    from agents.auto_apply import submit_application
+                    result = submit_application(url, approved=True)
+                    if result.get("status") == "submitted":
+                        st.success("✅ Application submitted! Check your browser.")
+                    else:
+                        st.error(f"Error: {result.get('message', 'Unknown error')}")
+                    st.rerun()
+
+                if declined:
+                    from agents.auto_apply import mark_approval_declined
+                    conn2 = get_conn()
+                    mark_approval_declined(conn2, url)
+                    st.rerun()
+
+            elif has_resume:
+                st.warning("✅ Resume tailored — run the **cover** stage first.")
+                if st.button("✅ Mark as Applied (manual)"):
+                    save_job_apply_status(url, "manual_submit_pending")
+                    st.rerun()
+            else:
+                st.warning("Run **tailor** stage first to prepare your resume.")
+                if st.button("✅ Mark as Applied (manual)"):
+                    save_job_apply_status(url, "manual_submit_pending")
+                    st.rerun()
 
 def page_pipeline():
     st.title("⚙️ Pipeline")
 
     stages = [
-        ("discover", "Discover Jobs",    "Search job boards and employer portals"),
-        ("enrich",   "Enrich Details",  "Fetch full job descriptions"),
-        ("score",   "Score Jobs",       "Rate jobs 1-10 using resume + Ollama"),
-        ("tailor",  "Tailor Resume",     "Rewrite resume bullets for score ≥ 7 jobs"),
-        ("cover",   "Write Cover Letter","Generate personalised cover letters"),
-        ("pdf",     "Export PDF",       "Convert to PDF"),
+        ("discover",  "Discover Jobs",       "Search job boards (LinkedIn, Indeed, Glassdoor, ZipRecruiter)"),
+        ("employers","Discover Employers",   "Scrape career pages from 18 target companies"),
+        ("enrich",    "Enrich Details",       "Fetch full job descriptions"),
+        ("score",     "Score Jobs",           "Rate jobs 1-10 using resume + Ollama"),
+        ("tailor",    "Tailor Resume",        "Rewrite resume bullets for score ≥ 7 jobs"),
+        ("cover",     "Write Cover Letter",   "Generate personalised cover letters"),
+        ("pdf",       "Export PDF",           "Convert to PDF"),
     ]
 
     for stage, label, desc in stages:
@@ -376,6 +480,20 @@ def page_settings():
         st.code(RESUME_PATH.read_text()[:3000], language="unicode")
     else:
         st.info("resume.txt not found. Run `pdftotext` on your CV PDF to create it.")
+
+    st.divider()
+
+    # Telegram config
+    st.subheader("📲 Telegram Notifications")
+    st.caption("Set these env vars or add them to ~/.applypilot/.env")
+    st.code("""# In ~/.applypilot/.env
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+
+# To get a bot token: message @BotFather on Telegram
+# To get your chat_id: message @userinfobot on Telegram
+""")
+    st.info("Telegram alerts are sent automatically when a job is queued for approval and when an application is submitted.")
 
 # ── Route ────────────────────────────────────────────────────────────────────
 if selection == "Dashboard":
