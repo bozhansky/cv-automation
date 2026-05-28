@@ -1,561 +1,386 @@
-"""ApplyPilot Web UI — Streamlit frontend for the job application pipeline."""
+"""
+ApplyPilot Web UI
+Single-file Streamlit frontend for the job application pipeline.
+Navigate: sidebar selects page, query_params handle job deep-links.
+"""
 
 import hashlib
-import io
+import json
 import os
-import sys
 import sqlite3
 import subprocess
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 
-# ── Bootstrap ────────────────────────────────────────────────────────────────
+# ── Paths ────────────────────────────────────────────────────────────────────
+APPLYPILOT_DIR = Path.home() / ".applypilot"
+DB_PATH        = APPLYPILOT_DIR / "applypilot.db"
+RESUME_PATH    = APPLYPILOT_DIR / "resume.txt"
+TAILORED_DIR   = APPLYPILOT_DIR / "tailored_resumes"
+COVER_DIR      = APPLYPILOT_DIR / "cover_letters"
+PROFILE_PATH   = APPLYPILOT_DIR / "profile.json"
+SEARCHES_PATH  = APPLYPILOT_DIR / "searches.yaml"
 
-APPLYPILOT_PKG = "/home/bostjan/.local/lib/python3.12/site-packages"
-if APPLYPILOT_PKG not in sys.path:
-    sys.path.insert(0, APPLYPILOT_PKG)
+# ── DB cursor helper ──────────────────────────────────────────────────────────
+def get_conn():
+    return sqlite3.connect(str(DB_PATH), timeout=30)
 
-# Make applypilot config importable
-os.environ["HOME"] = "/home/bostjan"
-os.environ["LLM_URL"] = "http://127.0.0.1:11434/v1"
+def row_to_dict(row) -> dict | None:
+    if row is None:
+        return None
+    cols = row.keys()
+    return dict(zip(cols, row))
 
-from applypilot.config import APP_DIR, DB_PATH, RESUME_PDF_PATH, SEARCH_CONFIG_PATH, load_env
-from applypilot.database import get_stats, get_jobs_by_stage, get_connection
+def job_by_url(url: str) -> dict | None:
+    row = get_conn().execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone()
+    return row_to_dict(row) if row else None
 
-# Ensure HOME for Streamlit
-os.environ["HOME"] = "/home/bostjan"
-load_env()
-
-st.set_page_config(
-    page_title="ApplyPilot",
-    page_icon="🎯",
-    layout="wide",
-    menu_items={
-        "About": "AI-powered job application automation — powered by Ollama + ApplyPilot"
-    }
-)
-
-# ── Constants ────────────────────────────────────────────────────────────────
-
-DB = Path("/home/bostjan/.applypilot/applypilot.db")
-APP_DIR = Path("/home/bostjan/.applypilot")
-COVER_DIR = APP_DIR / "cover_letters"
-TAILORED_DIR = APP_DIR / "tailored_resumes"
-RESUME_TXT = APP_DIR / "resume.txt"
-
-MIN_SCORE_DEFAULT = 7
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=30)
-def get_stats_cached():
-    return get_stats()
-
-@st.cache_data(ttl=30)
-def get_jobs_cached(stage="scored", min_score=7, limit=200):
-    return get_jobs_by_stage(stage=stage, min_score=min_score, limit=limit)
-
-def get_all_jobs(limit=500):
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM jobs ORDER BY fit_score DESC NULLS LAST, discovered_at DESC LIMIT ?",
-        (limit,)
+def all_jobs() -> list[dict]:
+    rows = get_conn().execute(
+        "SELECT * FROM jobs ORDER BY fit_score DESC NULLS LAST, discovered_at DESC LIMIT 500"
     ).fetchall()
     if not rows:
         return []
     cols = rows[0].keys()
     return [dict(zip(cols, r)) for r in rows]
 
-def read_file(path: Path) -> str:
-    if path and path.exists():
-        return path.read_text(encoding="utf-8", errors="replace")
-    return ""
-
-def score_badge(score: int | None) -> str:
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def score_badge(score):
     if score is None:
-        return "⚪ Unscored"
+        return "⚪ No score"
     if score >= 8:
         return f"🟢 {score}"
-    if score >= 7:
+    if score >= 6:
         return f"🟡 {score}"
-    if score >= 5:
-        return f"🟠 {score}"
     return f"🔴 {score}"
 
-def run_pipeline_stage(stage: str) -> str:
-    """Run a pipeline stage and return output."""
+def read_file_text(path_str: str | None) -> str:
+    if not path_str:
+        return ""
+    p = Path(path_str)
+    if p.exists():
+        try:
+            return p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+    return ""
+
+def run_stage(stage: str, timeout=600) -> tuple[str, int]:
+    """Run applypilot stage. Returns (output, returncode)."""
     env = os.environ.copy()
-    env["HOME"] = "/home/bostjan"
-    result = subprocess.run(
+    env["HOME"] = str(Path.home())
+    res = subprocess.run(
         ["python3", "-m", "applypilot", "run", stage],
-        capture_output=True,
-        text=True,
-        timeout=600,
-        cwd="/home/bostjan",
-        env=env,
+        capture_output=True, text=True, timeout=timeout,
+        cwd=str(Path.home()), env=env,
     )
-    return result.stdout + result.stderr
+    return res.stdout + res.stderr, res.returncode
 
-def run_applypilot_command(cmd: list[str], timeout=600) -> tuple[str, str, int]:
-    """Run an applypilot CLI command. Returns (stdout, stderr, returncode)."""
-    env = os.environ.copy()
-    env["HOME"] = "/home/bostjan"
-    result = subprocess.run(
-        ["python3", "-m", "applypilot"] + cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        cwd="/home/bostjan",
-        env=env,
+def save_job_apply_status(url: str, status: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE jobs SET apply_status = ?, applied_at = ? WHERE url = ?",
+        (status, datetime.utcnow().isoformat(), url)
     )
-    return result.stdout, result.stderr, result.returncode
+    conn.commit()
 
-# ── Page: Dashboard ─────────────────────────────────────────────────────────
+# ── Page config ──────────────────────────────────────────────────────────────
+PAGES = ["Dashboard", "Jobs", "Job Detail", "Pipeline", "Settings"]
 
+def _set_page(page: str):
+    st.query_params["page"] = page
+    st.query_params["job"] = ""
+
+def _current_page() -> str:
+    p = st.query_params.get("page")
+    return p if p in PAGES else "Dashboard"
+
+def _current_job() -> str | None:
+    raw = st.query_params.get("job")
+    if raw:
+        try:
+            return urllib.parse.unquote(raw)
+        except Exception:
+            return raw
+    return None
+
+# Bootstrap: if a job param is set, record it and switch to Job Detail
+_job_url = _current_job()
+if _job_url and _current_page() != "Job Detail":
+    _set_page("Job Detail")
+
+st.set_page_config(
+    page_title="ApplyPilot",
+    page_icon="🎯",
+    layout="wide",
+)
+
+# ── Sidebar navigation ────────────────────────────────────────────────────────
+st.sidebar.title("🎯 ApplyPilot")
+selection = st.sidebar.radio("Navigate", PAGES, index=PAGES.index(_current_page()))
+
+# ── Pages ────────────────────────────────────────────────────────────────────
 def page_dashboard():
-    st.title("🎯 ApplyPilot — Job Application Pipeline")
+    conn = get_conn()
+    total    = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    scored   = conn.execute("SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL").fetchone()[0]
+    tailored = conn.execute("SELECT COUNT(*) FROM jobs WHERE tailored_at IS NOT NULL").fetchone()[0]
+    cover    = conn.execute("SELECT COUNT(*) FROM jobs WHERE cover_letter_path IS NOT NULL").fetchone()[0]
+    applied  = conn.execute("SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL").fetchone()[0]
+    ready    = conn.execute("SELECT COUNT(*) FROM jobs WHERE fit_score >= 7").fetchone()[0]
 
-    stats = get_stats_cached()
-
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    col1.metric("Total Jobs", stats["total"])
-    col2.metric("Discovered", stats["total"])
-    col3.metric("With Descriptions", stats["with_description"])
-    col4.metric("Scored", stats["scored"])
-    col5.metric("Tailored", stats["tailored"])
-    col6.metric("Cover Letters", stats["with_cover_letter"])
+    st.title("📊 Pipeline Dashboard")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Total Jobs", total)
+    c2.metric("Scored", scored)
+    c3.metric("Tailored", tailored)
+    c4.metric("Cover Letters", cover)
+    c5.metric("Ready to Apply", ready)
+    c6.metric("Applied", applied)
 
     st.divider()
 
     # Score distribution
-    col_left, col_right = st.columns([1, 1])
-
-    with col_left:
-        st.subheader("📊 Score Distribution")
-        dist = stats.get("score_distribution", [])
-        if dist:
-            dist_data = sorted(dist, key=lambda x: x[0] or 0, reverse=True)
-            chart_data = {"score": [str(r[0]) for r in dist_data], "count": [r[1] for r in dist_data]}
-            st.bar_chart(chart_data, x="score", y="count")
-        else:
-            st.info("No scored jobs yet. Run the score stage.")
-
-    with col_right:
-        st.subheader("📋 Pipeline Summary")
-        pipeline_items = [
-            ("Discover", stats["total"], stats["pending_detail"], "discover"),
-            ("Enrich", stats["with_description"], stats.get("pending_detail", 0), "enrich"),
-            ("Score", stats["scored"], stats.get("unscored", 0), "score"),
-            ("Tailor", stats["tailored"], stats.get("untailored_eligible", 0), "tailor"),
-            ("Cover Letter", stats["with_cover_letter"], 0, "cover"),
-            ("Applied", stats.get("applied", 0), stats.get("ready_to_apply", 0), "apply"),
-        ]
-        for name, done, pending, stage in pipeline_items:
-            p = st.progress(done / max(stats["total"], 1), text=f"{name}: {done} done, {pending} pending")
-            if st.button(f"▶ Run {name}", key=f"btn_{stage}"):
-                with st.spinner(f"Running {name}..."):
-                    output = run_pipeline_stage(stage)
-                    st.code(output[-2000:] if len(output) > 2000 else output, language="bash")
-                    st.rerun()
+    rows = conn.execute(
+        "SELECT fit_score, COUNT(*) FROM jobs WHERE fit_score IS NOT NULL GROUP BY fit_score ORDER BY fit_score DESC"
+    ).fetchall()
+    if rows:
+        chart_data = {"Score": [str(r[0]) for r in rows], "Count": [r[1] for r in rows]}
+        st.bar_chart(chart_data, x="Score", y="Count")
 
     st.divider()
-
-    # Recent jobs
-    st.subheader("🆕 Recent Jobs")
-    jobs = get_all_jobs(limit=20)
-    for job in jobs[:10]:
+    st.subheader("Recent Jobs")
+    recent = all_jobs()[:10]
+    for job in recent:
         with st.container():
-            col_a, col_b, col_c = st.columns([4, 1, 1])
-            with col_a:
-                st.write(f"**{job['title']}**")
-                st.caption(f"{job.get('company_name', job.get('site', '?'))} · {job.get('location', '')}")
-            with col_b:
+            c1, c2, c3, c4 = st.columns([1, 4, 2, 1])
+            with c1:
                 st.write(score_badge(job.get("fit_score")))
-            with col_c:
-                st.write(f"via {job.get('site', '?')}")
+            with c2:
+                st.markdown(f"**{job.get('title', '?')}**")
+                st.caption(f"{job.get('site', '')} · {job.get('location', '')}")
+            with c3:
+                opts = []
+                if job.get("tailored_resume_path"):
+                    opts.append("✅ Tailored")
+                else:
+                    opts.append("⬜ Not tailored")
+                if job.get("cover_letter_path"):
+                    opts.append("✅ Cover")
+                else:
+                    opts.append("⬜ No cover")
+                st.caption(" · ".join(opts))
+            with c4:
+                url = job.get("url", "")
+                uk = hashlib.sha1(url.encode()).hexdigest()[:12]
+                if st.button("View", key=f"dv_{uk}"):
+                    st.query_params["job"] = url
+                    st.query_params["page"] = "Job Detail"
+                    st.rerun()
             st.divider()
 
-# ── Page: Jobs ───────────────────────────────────────────────────────────────
-
 def page_jobs():
+    conn = get_conn()
     st.title("💼 Job Bank")
 
     # Filters
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        min_score_filter = st.slider("Minimum Score", 1, 10, MIN_SCORE_DEFAULT)
-    with col2:
-        site_filter = st.selectbox("Source", ["All", "linkedin", "indeed", "glassdoor", "google", "workday"])
-    with col3:
-        search = st.text_input("🔍 Search jobs", placeholder="Filter by title...")
+    sites = ["All"] + [
+        r[0] for r in conn.execute("SELECT DISTINCT site FROM jobs ORDER BY site").fetchall()
+    ]
+    c1, c2, c3 = st.columns([1, 1, 2])
+    min_score = c1.slider("Min Score", 1, 10, 6)
+    site_sel = c2.selectbox("Source", sites)
+    search  = c3.text_input("🔍 Search", placeholder="Filter by title...")
 
-    all_jobs = get_all_jobs(limit=500)
-
-    # Apply filters
-    if site_filter != "All":
-        all_jobs = [j for j in all_jobs if j.get("site") == site_filter]
+    jobs = all_jobs()
+    if site_sel != "All":
+        jobs = [j for j in jobs if j.get("site") == site_sel]
     if search:
-        all_jobs = [j for j in all_jobs if search.lower() in (j.get("title") or "").lower()]
+        jobs = [j for j in jobs if search.lower() in (j.get("title") or "").lower()]
+    jobs = [j for j in jobs if (j.get("fit_score") or 0) >= min_score]
 
-    st.caption(f"Showing {len(all_jobs)} of {len(get_all_jobs(limit=500))} total jobs")
+    st.caption(f"Showing {len(jobs)} of {len(all_jobs())} total jobs")
 
-    # Score filter
-    all_jobs = [j for j in all_jobs if (j.get("fit_score") or 0) >= min_score_filter]
-
-    for job in all_jobs:
+    for job in jobs:
         score = job.get("fit_score")
-        url = job.get("url", "")
-        title = job.get("title", "Unknown")
-
+        url   = job.get("url", "")
         with st.container():
-            cols = st.columns([1, 5, 2, 1])
-            with cols[0]:
+            c1, c2, c3, c4 = st.columns([1, 5, 2, 1])
+            with c1:
                 st.write(score_badge(score))
-            with cols[1]:
-                st.markdown(f"**{title}**")
-                st.caption(f"{job.get('location', '')} · {job.get('site', '')} · {job.get('salary', '')}")
-                if url:
-                    st.caption(f"[Apply URL]({url[:80]}...)" if len(url) > 80 else f"[Apply URL]({url})")
-            with cols[2]:
-                tailored = "✅ Tailored" if job.get("tailored_resume_path") else "⬜ Not tailored"
-                cover = "✅ Cover" if job.get("cover_letter_path") else "⬜ No cover"
-                st.caption(tailored)
-                st.caption(cover)
-            with cols[3]:
-                unique_key = hashlib.sha1(url.encode()).hexdigest()[:12]
-                if st.button("View", key=f"view_{unique_key}"):
-                    st.switch_page("app.py", query_params={"job": url})
+            with c2:
+                st.markdown(f"**{job.get('title', '?')}**")
+                st.caption(f"{job.get('site', '')} · {job.get('location', '')}")
+            with c3:
+                opts = []
+                if job.get("tailored_resume_path"): opts.append("✅ Tailored")
+                else: opts.append("⬜ Tailor")
+                if job.get("cover_letter_path"):   opts.append("✅ Cover")
+                else: opts.append("⬜ Cover")
+                st.caption(" · ".join(opts))
+            with c4:
+                uk = hashlib.sha1(url.encode()).hexdigest()[:12]
+                if st.button("View", key=f"jv_{uk}"):
+                    st.query_params["job"] = url
+                    st.query_params["page"] = "Job Detail"
+                    st.rerun()
             st.divider()
-
-# ── Page: Job Detail ─────────────────────────────────────────────────────────
 
 def page_job_detail():
     st.title("📋 Job Detail")
-
-    selected = st.session_state.get("selected_job_url")
-    if not selected:
-        st.info("No job selected. Go to the Jobs page and click 'View' on a job.")
+    url = _current_job()
+    if not url:
+        st.info("No job selected. Go to **Jobs** and click **View** on any job.")
         return
 
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (selected,)).fetchone()
-    if not row:
+    job = job_by_url(url)
+    if not job:
         st.error("Job not found in database.")
         return
 
-    cols = row.keys()
-    job = dict(zip(cols, row))
+    # Update query_params so refresh stays on this job
+    st.query_params["job"] = url
 
-    # Header
-    st.header(job.get("title", "Unknown Title"))
-    score = job.get("fit_score")
-    st.write(f"**Company:** {job.get('company_name', job.get('site', '?'))}")
-    st.write(f"**Location:** {job.get('location', 'N/A')}")
-    st.write(f"**Source:** {job.get('site', 'N/A')}")
-    st.write(f"**Score:** {score_badge(score)}")
-
+    st.header(job.get("title", "?"))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.write(f"**Source:** {job.get('site', '?')}")
+    c2.write(f"**Location:** {job.get('location', 'N/A')}")
+    c3.write(f"**Score:** {score_badge(job.get('fit_score'))}")
     if job.get("salary"):
-        st.write(f"**Salary:** {job['salary']}")
+        c4.write(f"**Salary:** {job.get('salary')}")
+
+    if job.get("application_url"):
+        st.markdown(f"[📎 Apply URL]({job.get('application_url')})")
 
     tabs = st.tabs(["📝 Description", "🧠 Scoring", "📄 Resume", "💌 Cover Letter", "🚀 Apply"])
 
-    # ── Description ────────────────────────────────────────────────────────
+    # ── Description ───────────────────────────────────────────────────────────
     with tabs[0]:
-        if job.get("full_description"):
-            st.markdown(job["full_description"][:5000])
-        elif job.get("description"):
-            st.markdown(job["description"][:5000])
-        else:
-            st.info("No description available yet. Run the enrich stage.")
+        desc = job.get("full_description") or job.get("description") or ""
+        st.text_area("Description", desc, height=400, label_visibility="collapsed")
 
-        st.divider()
-        if job.get("application_url"):
-            st.markdown(f"**Application URL:** [{job['application_url'][:80]}]({job['application_url']})")
-        if job.get("url"):
-            st.markdown(f"**Original URL:** [{job['url'][:80]}]({job['url']})")
-
-    # ── Scoring ────────────────────────────────────────────────────────────
+    # ── Scoring ────────────────────────────────────────────────────────────────
     with tabs[1]:
-        if job.get("fit_score") is not None:
-            st.metric("Fit Score", job["fit_score"])
-        else:
-            st.info("Not scored yet.")
-
-        if job.get("score_reasoning"):
+        score      = job.get("fit_score")
+        reasoning  = job.get("score_reasoning") or ""
+        scored_at  = job.get("scored_at") or ""
+        st.subheader(f"Fit Score: {score_badge(score)}")
+        if reasoning:
             st.markdown("**Reasoning:**")
-            st.code(job["score_reasoning"], language="markdown")
+            st.info(reasoning)
+        else:
+            st.info("Not yet scored.")
+        if scored_at:
+            st.caption(f"Scored at: {scored_at}")
 
-        if st.button("♻️ Re-score this job"):
-            st.info("Re-scoring individual jobs is not yet supported. Run the full score stage.")
-            if st.button("▶ Run score stage"):
-                with st.spinner("Running score stage..."):
-                    output = run_pipeline_stage("score")
-                    st.code(output[-3000:], language="bash")
-                    st.rerun()
-
-    # ── Resume ─────────────────────────────────────────────────────────────
+    # ── Resume ────────────────────────────────────────────────────────────────
     with tabs[2]:
-        if job.get("tailored_resume_path"):
-            path = Path(job["tailored_resume_path"])
-            if path.exists():
-                content = read_file(path)
-                st.text_area("Tailored Resume", content, height=400, label_visibility="collapsed")
-                st.download_button("📥 Download tailored resume", content, file_name=f"resume_{job['title'][:20]}.txt")
-            else:
-                st.warning(f"File not found: {path}")
+        path  = job.get("tailored_resume_path") or ""
+        text  = read_file_text(path)
+        if text:
+            st.text_area("Tailored Resume", text, height=400, label_visibility="collapsed")
         else:
-            st.info("No tailored resume yet. Run the tailor stage.")
-            if st.button("✂️ Tailor this resume"):
-                st.info("Per-job tailoring not yet supported. Run the full tailor stage.")
+            st.info("Not yet tailored. Run the **tailor** stage in Pipeline.")
 
-    # ── Cover Letter ───────────────────────────────────────────────────────
+    # ── Cover Letter ──────────────────────────────────────────────────────────
     with tabs[3]:
-        if job.get("cover_letter_path"):
-            path = Path(job["cover_letter_path"])
-            if path.exists():
-                content = read_file(path)
-                st.text_area("Cover Letter", content, height=400, label_visibility="collapsed")
-                st.download_button("📥 Download cover letter", content, file_name=f"cover_{job['title'][:20]}.txt")
-            else:
-                st.warning(f"File not found: {path}")
+        path  = job.get("cover_letter_path") or ""
+        text  = read_file_text(path)
+        if text:
+            st.text_area("Cover Letter", text, height=400, label_visibility="collapsed")
         else:
-            st.info("No cover letter yet. Run the cover stage.")
-            if st.button("✍️ Generate cover letter"):
-                st.info("Per-job cover letter generation not yet supported. Run the full cover stage.")
+            st.info("Not yet generated. Run the **cover** stage in Pipeline.")
 
-    # ── Apply ──────────────────────────────────────────────────────────────
+    # ── Apply ────────────────────────────────────────────────────────────────
     with tabs[4]:
-        applied_key = f"applied_{st.session_state.get('_selected_key','x')}"
+        applied_at  = job.get("applied_at")
+        apply_url   = job.get("application_url") or job.get("url") or ""
+        apply_st    = job.get("apply_status") or ""
 
-        if st.session_state.get("applied_clicked"):
-            import sqlite3
-            from datetime import datetime, timezone
-            conn = get_connection()
-            now = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                "UPDATE jobs SET applied_at = ?, apply_status = 'manual_submit_pending' WHERE url = ?",
-                (now, st.session_state.get("selected_job_url", ""))
-            )
-            conn.commit()
-            st.success("✅ Application marked as submitted!")
-            st.info("This records a manual submit. The Ollama auto-apply agent is not yet built.")
-            st.session_state["applied_clicked"] = False
-            st.rerun()
-        elif job.get("applied_at"):
-            st.success(f"✅ Applied on {job['applied_at']}")
-            if job.get("apply_status"):
-                st.write(f"**Status:** {job['apply_status']}")
-            if job.get("apply_error"):
-                st.error(f"**Error:** {job['apply_error']}")
+        if applied_at:
+            st.success(f"✅ Applied at {applied_at}")
+            if apply_st:
+                st.caption(f"Status: {apply_st}")
         else:
-            if not job.get("tailored_resume_path"):
-                st.warning("⚠️ Need a tailored resume before applying. Run tailor + cover first.")
-            elif not job.get("cover_letter_path"):
-                st.warning("⚠️ Need a cover letter before applying. Run cover stage first.")
-            else:
-                st.success("✅ Ready to apply")
-
-            if job.get("application_url"):
-                st.markdown(f"**Apply at:** [{job['application_url'][:80]}]({job['application_url']})")
-
-            if st.button("🚀 Submit Application", type="primary", key=applied_key):
-                st.session_state["applied_clicked"] = True
+            st.markdown(f"**Apply URL:** [Open]({apply_url})")
+            st.info("Auto-apply with Ollama agent is not yet built. Use the link above to apply manually.")
+            if st.button("✅ Mark as Applied", type="primary"):
+                save_job_apply_status(url, "manual_submit_pending")
                 st.rerun()
 
-# ── Page: Pipeline ───────────────────────────────────────────────────────────
-
 def page_pipeline():
-    st.title("⚙️ Pipeline Control")
+    st.title("⚙️ Pipeline")
 
-    st.subheader("Run Pipeline Stages")
-
-    cols = st.columns(3)
-    stage_info = [
-        ("1️⃣ Discover", "Find new jobs from LinkedIn, Indeed, Glassdoor, and Workday portals", "discover"),
-        ("2️⃣ Enrich", "Extract full job descriptions and application URLs", "enrich"),
-        ("3️⃣ Score", "Rate each job 1-10 using Ollama LLM against your resume", "score"),
-        ("4️⃣ Tailor", "Rewrite resume bullets to match job description keywords (score ≥7)", "tailor"),
-        ("5️⃣ Cover Letter", "Generate personalised cover letters for tailored jobs", "cover"),
-        ("6️⃣ PDF Export", "Convert all tailored resumes and cover letters to PDF", "pdf"),
+    stages = [
+        ("discover", "Discover Jobs",    "Search job boards and employer portals"),
+        ("enrich",   "Enrich Details",  "Fetch full job descriptions"),
+        ("score",   "Score Jobs",       "Rate jobs 1-10 using resume + Ollama"),
+        ("tailor",  "Tailor Resume",     "Rewrite resume bullets for score ≥ 7 jobs"),
+        ("cover",   "Write Cover Letter","Generate personalised cover letters"),
+        ("pdf",     "Export PDF",       "Convert to PDF"),
     ]
 
-    for i, (label, desc, stage) in enumerate(stage_info):
-        with cols[i % 3]:
-            st.subheader(label)
+    for stage, label, desc in stages:
+        with st.expander(f"▶ {label} — `{stage}`", expanded=(stage in ["tailor","cover"])):
             st.caption(desc)
-            if st.button(f"▶ Run {stage}", type="primary", key=f"run_{stage}"):
-                with st.spinner(f"Running {stage}..."):
-                    output = run_pipeline_stage(stage)
-                    st.code(output[-3000:] if len(output) > 3000 else output, language="bash")
-                    st.rerun()
-
-    st.divider()
-
-    # Run all stages
-    st.subheader("🚀 Run All Stages")
-    st.write("Run the complete pipeline: discover → enrich → score → tailor → cover → pdf")
-    if st.button("▶ Run Full Pipeline", type="primary"):
-        stages = ["discover", "enrich", "score", "tailor", "cover", "pdf"]
-        progress = st.progress(0)
-        for i, stage in enumerate(stages):
-            with st.spinner(f"Running {stage}..."):
-                output = run_pipeline_stage(stage)
-            progress.progress((i + 1) / len(stages), text=f"{stage} complete")
-        st.success("Pipeline complete!")
-        st.rerun()
-
-    st.divider()
-
-    # Ollama status
-    st.subheader("🧠 Ollama Status")
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            "http://127.0.0.1:11434/v1/chat/completions",
-            method="POST"
-        )
-        req.add_header("Content-Type", "application/json")
-        import json
-        data = json.dumps({"model": "gemma4:31b-cloud", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 5}).encode()
-        req.add_header("Content-Length", str(len(data)))
-        with urllib.request.urlopen(req, data=data, timeout=5) as resp:
-            result = json.loads(resp.read())
-            st.success(f"Ollama OK: {result['choices'][0]['message']['content']}")
-    except Exception as e:
-        st.error(f"Ollama not responding: {e}")
-
-# ── Page: Settings ───────────────────────────────────────────────────────────
+            out, rc = st.columns([4, 1])
+            with out:
+                if st.button(f"▶ Run {label}", key=f"run_{stage}"):
+                    with st.spinner(f"Running `{stage}`..."):
+                        output, rc = run_stage(stage)
+                    st.code(output[-4000:] if len(output) > 4000 else output, language="bash")
+                    if rc == 0:
+                        st.success(f"`{stage}` completed successfully.")
+                    else:
+                        st.error(f"`{stage}` failed (exit {rc}).")
+            with rc:
+                st.write(f"Exit: {rc if 'rc' in dir() else '—'}")
 
 def page_settings():
     st.title("⚙️ Settings")
 
-    tabs = st.tabs(["👤 Profile", "🔍 Searches", "🤖 LLM Config", "📁 Files"])
+    # Profile editor
+    st.subheader("👤 Profile (profile.json)")
+    profile_text = ""
+    if PROFILE_PATH.exists():
+        profile_text = PROFILE_PATH.read_text()
+    updated = st.text_area("profile.json", profile_text, height=300, label_visibility="collapsed")
+    if st.button("💾 Save profile.json"):
+        PROFILE_PATH.write_text(updated)
+        st.success("Saved profile.json")
 
-    # ── Profile ─────────────────────────────────────────────────────────────
-    with tabs[0]:
-        st.subheader("profile.json")
-        profile_path = Path("/home/bostjan/.applypilot/profile.json")
-        if profile_path.exists():
-            content = profile_path.read_text()
-            edited = st.text_area("Edit profile.json", content, height=500)
-            if st.button("💾 Save Profile"):
-                profile_path.write_text(edited)
-                st.success("Profile saved!")
-        else:
-            st.error("profile.json not found at ~/.applypilot/profile.json")
+    st.divider()
 
-        st.divider()
-        st.subheader("Work Experience")
-        import json
-        try:
-            profile = json.loads(profile_path.read_text())
-            for job in profile.get("work_experience", []):
-                st.write(f"**{job.get('title')}** at {job.get('company')} ({job.get('start_date', '?')} – {job.get('end_date', 'now')})")
-                for bullet in job.get("bullets", []):
-                    st.write(f"  • {bullet}")
-        except:
-            pass
+    # Searches editor
+    st.subheader("🔍 Job Searches (searches.yaml)")
+    searches_text = ""
+    if SEARCHES_PATH.exists():
+        searches_text = SEARCHES_PATH.read_text()
+    updated_s = st.text_area("searches.yaml", searches_text, height=300, label_visibility="collapsed")
+    if st.button("💾 Save searches.yaml"):
+        SEARCHES_PATH.write_text(updated_s)
+        st.success("Saved searches.yaml")
 
-    # ── Searches ────────────────────────────────────────────────────────────
-    with tabs[1]:
-        st.subheader("searches.yaml")
-        searches_path = Path("/home/bostjan/.applypilot/searches.yaml")
-        if searches_path.exists():
-            content = searches_path.read_text()
-            edited = st.text_area("Edit searches.yaml", content, height=400)
-            if st.button("💾 Save Searches"):
-                searches_path.write_text(edited)
-                st.success("searches.yaml saved!")
-        else:
-            st.error("searches.yaml not found")
+    st.divider()
 
-        st.divider()
-        st.subheader("Job Boards Enabled")
-        boards = ["linkedin", "indeed", "glassdoor", "google"]
-        for b in boards:
-            st.write(f"  • {b}")
+    # Resume viewer
+    st.subheader("📄 Resume (resume.txt)")
+    if RESUME_PATH.exists():
+        st.code(RESUME_PATH.read_text()[:3000], language="unicode")
+    else:
+        st.info("resume.txt not found. Run `pdftotext` on your CV PDF to create it.")
 
-    # ── LLM Config ─────────────────────────────────────────────────────────
-    with tabs[2]:
-        st.subheader(".env — LLM Configuration")
-        env_path = Path("/home/bostjan/.applypilot/.env")
-        if env_path.exists():
-            content = env_path.read_text()
-            edited = st.text_area("Edit .env", content, height=200)
-            if st.button("💾 Save .env"):
-                env_path.write_text(edited)
-                st.success(".env saved! Restart pipeline for changes to take effect.")
-        else:
-            st.error(".env not found")
-
-        st.divider()
-        st.subheader("Available Ollama Models")
-        try:
-            import urllib.request, json
-            req = urllib.request.Request("http://127.0.0.1:11434/api/tags", headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                models = json.loads(resp.read()).get("models", [])
-                for m in models:
-                    st.write(f"  • {m.get('name', '?')}")
-        except Exception as e:
-            st.warning(f"Could not fetch models: {e}")
-
-    # ── Files ───────────────────────────────────────────────────────────────
-    with tabs[3]:
-        st.subheader("ApplyPilot Directory")
-        app_dir = Path("/home/bostjan/.applypilot")
-        for item in sorted(app_dir.iterdir()):
-            size = item.stat().st_size if item.is_file() else "-"
-            st.write(f"  {'📁' if item.is_dir() else '📄'} {item.name} ({size} bytes)")
-
-        st.divider()
-        st.subheader("Generated Outputs")
-        st.write(f"**Cover Letters:** {COVER_DIR}")
-        st.write(f"**Tailored Resumes:** {TAILORED_DIR}")
-        st.write(f"**Database:** {DB}")
-
-        cover_count = len(list(COVER_DIR.glob("*"))) if COVER_DIR.exists() else 0
-        tailored_count = len(list(TAILORED_DIR.glob("*"))) if TAILORED_DIR.exists() else 0
-        st.metric("Cover letters generated", cover_count)
-        st.metric("Tailored resumes generated", tailored_count)
-
-# ── Main ─────────────────────────────────────────────────────────────────────
-
-def main():
-    # ── Init: handle query-param deep-links from job view button ──────────────
-    # pattern: app.py?job=https://... (set via st.switch_page query_params)
-    _job_param = st.query_params.get("job")
-    if _job_param:
-        st.session_state["_nav"] = "📋 Job Detail"
-        st.session_state["selected_job_url"] = _job_param
-        st.session_state["_selected_key"] = hashlib.sha1(_job_param.encode()).hexdigest()[:12]
-    elif "_nav" not in st.session_state:
-        st.session_state["_nav"] = "📊 Dashboard"
-        st.session_state["selected_job_url"] = None
-
-    pages = {
-        "📊 Dashboard": page_dashboard,
-        "💼 Jobs": page_jobs,
-        "📋 Job Detail": page_job_detail,
-        "⚙️ Pipeline": page_pipeline,
-        "⚙️ Settings": page_settings,
-    }
-
-    st.sidebar.title("🎯 ApplyPilot")
-    st.sidebar.caption("AI-powered job application automation")
-
-    page_list = list(pages.keys())
-    default_idx = page_list.index(st.session_state["_nav"]) if st.session_state["_nav"] in page_list else 0
-    selection = st.sidebar.radio("Navigate", page_list, index=default_idx, key="_nav_radio")
-    st.session_state["_nav"] = selection
-
-    if selection == "📋 Job Detail" and not st.session_state.get("selected_job_url"):
-        selection = "📊 Dashboard"
-        st.session_state["_nav"] = "📊 Dashboard"
-
-    pages[selection]()
-
-if __name__ == "__main__":
-    main()
+# ── Route ────────────────────────────────────────────────────────────────────
+if selection == "Dashboard":
+    page_dashboard()
+elif selection == "Jobs":
+    page_jobs()
+elif selection == "Job Detail":
+    page_job_detail()
+elif selection == "Pipeline":
+    page_pipeline()
+elif selection == "Settings":
+    page_settings()
