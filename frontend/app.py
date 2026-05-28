@@ -31,20 +31,24 @@ def get_conn():
 def row_to_dict(row) -> dict | None:
     if row is None:
         return None
-    cols = row.keys()
+    conn = get_conn()
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
     return dict(zip(cols, row))
 
 def job_by_url(url: str) -> dict | None:
-    row = get_conn().execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone()
-    return row_to_dict(row) if row else None
+    conn = get_conn()
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone()
+    return dict(zip(cols, row)) if row else None
 
 def all_jobs() -> list[dict]:
-    rows = get_conn().execute(
+    conn = get_conn()
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    rows = conn.execute(
         "SELECT * FROM jobs ORDER BY fit_score DESC NULLS LAST, discovered_at DESC LIMIT 500"
     ).fetchall()
     if not rows:
         return []
-    cols = rows[0].keys()
     return [dict(zip(cols, r)) for r in rows]
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
