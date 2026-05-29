@@ -108,11 +108,15 @@ def job_by_url(url: str) -> dict | None:
     row = conn.execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone()
     return dict(zip(cols, row)) if row else None
 
-def all_jobs() -> list[dict]:
+def all_jobs(sort_by="score") -> list[dict]:
     conn = get_conn()
     cols = [r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if sort_by == "date":
+        order = "discovered_at DESC NULLS LAST, fit_score DESC"
+    else:  # default score
+        order = "fit_score DESC NULLS LAST, discovered_at DESC"
     rows = conn.execute(
-        "SELECT * FROM jobs ORDER BY fit_score DESC NULLS LAST, discovered_at DESC LIMIT 500"
+        f"SELECT * FROM jobs ORDER BY {order} LIMIT 500"
     ).fetchall()
     if not rows:
         return []
@@ -399,7 +403,7 @@ def page_dashboard():
 
     st.divider()
     st.subheader("Recent Jobs")
-    recent = all_jobs()[:10]
+    recent = all_jobs(sort_by="score")[:10]
     for job in recent:
         with st.container():
             c1, c2, c3, c4 = st.columns([1, 4, 2, 1])
@@ -432,23 +436,30 @@ def page_jobs():
     conn = get_conn()
     st.title("💼 Job Bank")
 
-    # Filters
+    # Filters + Sort
     sites = ["All"] + [
         r[0] for r in conn.execute("SELECT DISTINCT site FROM jobs ORDER BY site").fetchall()
     ]
-    c1, c2, c3 = st.columns([1, 1, 2])
+    
+    # Initialize sort preference in session state
+    if "job_sort_by" not in st.session_state:
+        st.session_state["job_sort_by"] = "score"
+    
+    c1, c2, c3, c4 = st.columns([1, 1, 2, 1])
     min_score = c1.slider("Min Score", 1, 10, 6)
     site_sel = c2.selectbox("Source", sites)
-    search  = c3.text_input("🔍 Search", placeholder="Filter by title...")
+    search = c3.text_input("🔍 Search", placeholder="Filter by title...")
+    sort_by = c4.selectbox("Sort by", ["Score", "Date"], index=0 if st.session_state["job_sort_by"] == "score" else 1, key="job_sort_by")
+    sort_key = "score" if sort_by == "Score" else "date"
 
-    jobs = all_jobs()
+    jobs = all_jobs(sort_by=sort_key)
     if site_sel != "All":
         jobs = [j for j in jobs if j.get("site") == site_sel]
     if search:
         jobs = [j for j in jobs if search.lower() in (j.get("title") or "").lower()]
     jobs = [j for j in jobs if (j.get("fit_score") or 0) >= min_score]
 
-    st.caption(f"Showing {len(jobs)} of {len(all_jobs())} total jobs")
+    st.caption(f"Showing {len(jobs)} of {len(all_jobs(sort_by=sort_key))} total jobs")
 
     for job in jobs:
         score = job.get("fit_score")
