@@ -1,6 +1,6 @@
-# ApplyPilot — Boštjan's Job Application Automation
+# ApplyPilot — Boštjan's AI Prompting Job Search Automation
 
-This document explains how to use the ApplyPilot system to automate job discovery, AI-powered scoring, resume tailoring, cover letter generation, and auto-apply.
+This document explains how to use the ApplyPilot system to automate job discovery, AI-powered scoring, resume tailoring, cover letter generation, and auto-apply — specifically tuned for finding AI / LLM / Prompt Engineering roles across the EU.
 
 ---
 
@@ -10,14 +10,16 @@ This document explains how to use the ApplyPilot system to automate job discover
 2. [Adding Job Search Resources](#2-adding-job-search-resources)
 3. [Configuration Files](#3-configuration-files)
 4. [Running the Pipeline](#4-running-the-pipeline)
-5. [Auto-Apply Agent](#5-auto-apply-agent)
-6. [Troubleshooting](#6-troubleshooting)
+5. [Web UI (Streamlit)](#5-web-ui-streamlit)
+6. [Auto-Apply Agent](#6-auto-apply-agent)
+7. [Troubleshooting](#7-troubleshooting)
+8. [Finding AI Prompting Jobs — Strategy Guide](#8-finding-ai-prompting-jobs--strategy-guide)
 
 ---
 
 ## 1. How the Pipeline Works
 
-ApplyPilot runs in six sequential stages. Each stage reads from and writes to a local SQLite database (`~/.applypilot/applypilot.db`).
+ApplyPilot runs in seven sequential stages. Each stage reads from and writes to a local SQLite database (`~/.applypilot/applypilot.db`).
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -29,7 +31,15 @@ ApplyPilot runs in six sequential stages. Each stage reads from and writes to a 
 └──────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────────────┐
-│  STAGE 2: enrich                                                      │
+│  STAGE 2: employers                                                  │
+│  Scrapes career pages from 18 target companies listed in            │
+│  employers.yaml — supplements JobSpy with direct company sources.    │
+│  Output: additional job entries from employer career pages           │
+│  Storage: applypilot.db "jobs" table                                 │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│  STAGE 3: enrich                                                      │
 │  Visits each job URL to extract the full job description, salary,   │
 │  requirements, and the direct application link.                     │
 │  Output: Full text descriptions for all discovered jobs              │
@@ -37,7 +47,7 @@ ApplyPilot runs in six sequential stages. Each stage reads from and writes to a 
 └──────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────────────┐
-│  STAGE 3: score                                                       │
+│  STAGE 4: score                                                       │
 │  Sends each job + your resume text to the LLM (Ollama) for scoring.  │
 │  Assigns a fit score 1-10 based on role alignment, skills match,      │
 │  location fit, and experience level.                                  │
@@ -46,7 +56,7 @@ ApplyPilot runs in six sequential stages. Each stage reads from and writes to a 
 └──────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────────────┐
-│  STAGE 4: tailor                                                      │
+│  STAGE 5: tailor                                                      │
 │  For jobs scoring ≥ 7: rewrites your resume bullets to match the     │
 │  job description keywords and phrasing.                              │
 │  Validation: checks for banned words, alignment with your profile.   │
@@ -55,7 +65,7 @@ ApplyPilot runs in six sequential stages. Each stage reads from and writes to a 
 └──────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────────────┐
-│  STAGE 5: cover                                                       │
+│  STAGE 6: cover                                                       │
 │  Generates a personalised cover letter for each tailored job.       │
 │  Each letter references specific requirements from the job posting.   │
 │  Output: cover_letters/ directory with .txt files                    │
@@ -63,17 +73,13 @@ ApplyPilot runs in six sequential stages. Each stage reads from and writes to a 
 └──────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────────────┐
-│  STAGE 6: pdf                                                         │
-│  Converts all tailored resumes and cover letters to PDF format.      │
-│  Output: tailored_resume/*.pdf and cover_letters/*.pdf               │
-└──────────────────────────────────────────────────────────────────────┘
-                              ↓
-┌──────────────────────────────────────────────────────────────────────┐
-│  STAGE 7: apply (custom Ollama agent — not yet built)                │
-│  Opens each job application URL in Playwright-controlled Chrome.     │
-│  Fills the form, uploads tailored resume + cover letter, answers    │
-│  screening questions, and submits. Powered by Ollama LLM reasoning.  │
-│  Status: applypilot.db updated (applied_at, apply_status)            │
+│  STAGE 7: apply                                                       │
+│  Ollama-powered Playwright automation with user approval gate.     │
+│  Polls for jobs with tailored resume + cover letter ready to apply. │
+│  Navigates to application URL, pre-fills form via Playwright.       │
+│  User confirms in the Streamlit UI before form is submitted.         │
+│  Telegram notification sent on submission.                           │
+│  Status: applypilot.db updated (applied_at, apply_status)           │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -126,17 +132,15 @@ location:
     - "Remote"
     - "Europe"
     - "Slovenia"
-    - "Germany"       # ← new
-    - "Netherlands"   # ← new
-    - "Sweden"        # ← new
+    - "Germany"
+    - "Netherlands"
+    - "Sweden"
     - "Anywhere"
   reject_patterns:
     - "onsite only"
     - "India"
     - "Philippines"
 ```
-
----
 
 ### 2b. Workday Employer Portals
 
@@ -159,8 +163,6 @@ employers:
 ```
 
 3. In `searches.yaml`, the Workday scraper automatically uses all queries defined in the `queries` list and filters results by your location accept/reject patterns.
-
----
 
 ### 2c. Smart Job Extractors (direct career site scraping)
 
@@ -209,7 +211,7 @@ LLM_PROVIDER=openai                    # Tell ApplyPilot to use OpenAI-compatibl
 OLLAMA_BASE_URL=http://127.0.0.1:11434/v1   # Your local Ollama server
 LLM_URL=http://127.0.0.1:11434/v1             # Alternative key (unlocks Tier 3)
 LLM_MODEL=gemma4:31b-cloud              # Model to use (see available models below)
-LLM_API_KEY=ollama                     # Any string (Ollama doesn't need real keys)
+LLM_API_KEY=***                     # Any string (Ollama doesn't need real keys)
 ```
 
 **Available Ollama models** (use `ollama list` to see yours):
@@ -240,20 +242,23 @@ export HOME=/home/bostjan
 # Stage 1: discover new jobs
 python3 -m applypilot run discover
 
-# Stage 2: enrich job descriptions
+# Stage 2: scrape employer career pages
+python3 -m applypilot run employers
+
+# Stage 3: enrich job descriptions
 python3 -m applypilot run enrich
 
-# Stage 3: score all jobs (requires LLM)
+# Stage 4: score all jobs (requires LLM)
 python3 -m applypilot run score
 
-# Stage 4: tailor resumes for jobs scoring ≥7
+# Stage 5: tailor resumes for jobs scoring ≥7
 python3 -m applypilot run tailor
 
-# Stage 5: generate cover letters for tailored jobs
+# Stage 6: generate cover letters for tailored jobs
 python3 -m applypilot run cover
 
-# Stage 6: convert to PDF
-python3 -m applypilot run pdf
+# Stage 7: auto-apply (Playwright + Ollama, approval-gated)
+python3 -m applypilot run apply
 
 # Stages 3-5 chained
 python3 -m applypilot run score tailor cover
@@ -270,58 +275,70 @@ python3 -m applypilot run all
 | `--min-score N` | Override minimum fit score for tailor/cover stages (default: 7) |
 | `-w N` | Parallel workers for discovery/enrichment stages (default: 1) |
 | `--stream` | Run stages concurrently (faster but less verbose) |
+| `--url TEXT` | Apply to a specific job URL |
+| `--limit N` | Limit number of jobs to process |
+| `--headless` | Run browser in headless mode (auto-apply only) |
 
 ### Checking status
 
 ```bash
 export HOME=/home/bostjan
 python3 -m applypilot status       # show DB counts
-python3 -m applypilot dashboard    # open web dashboard
+python3 -m applypilot dashboard   # open web dashboard (Streamlit)
 ```
-
-### Re-scoring with different settings
-
-If you change the minimum score threshold, re-run tailor/cover only for qualifying jobs. ApplyPilot skips jobs that already have tailored resumes unless you force it.
 
 ---
 
-## 5. Auto-Apply Agent
+## 5. Web UI (Streamlit)
 
-ApplyPilot's native auto-apply uses **Claude Code** to control Playwright MCP. This requires:
-- `claude` CLI installed (`brew install anthropic/claude/claude`)
-- `npx playwright install chromium`
-- Anthropic API key
+A full Streamlit frontend is available at `frontend/app.py`. Start it with:
 
-**For Ollama-powered auto-apply** (what you're building):
-
-The idea is to replace the Claude Code call in `apply/launcher.py` with a direct Ollama chat completions call that reasons through the application form, then uses Playwright's Python API (`from playwright.sync_api import sync_playwright`) to execute the browser actions.
-
-**Core tools to use from Playwright MCP** (mirror what ApplyPilot uses):
-
-```
-mcp__chrome__navigate(url)         → page.goto(url)
-mcp__chrome__click(selector)       → page.click(selector)
-mcp__chrome__fill(selector, text) → page.fill(selector, text)
-mcp__chrome__press(key)           → page.press(selector, key)
-mcp__chrome__select_option(...)   → page.select_option(...)
-mcp__chrome__upload_file(...)      → page.set_input_files(...)
-mcp__chrome__submit()              → page.click("[type=submit]")
-mcp__chrome__screenshot()         → page.screenshot()
+```bash
+cd /media/bostjan/Documents/Osebno/ZAPOSLITEV/AI\ JOB\ 2026
+streamlit run frontend/app.py
 ```
 
-**Steps to build the Ollama apply agent:**
+Or use the provided launcher:
+```bash
+./run_frontend.sh
+```
 
-1. In `~/.applypilot/`, create `apply_agent/ollama_agent.py`
-2. Use `playwright.sync_api` to launch a Chrome browser in headless mode
-3. Call `OLLAMA_URL/v1/chat/completions` with `gemma4:31b-cloud` and the ApplyPilot apply prompt (from `apply/prompt.py`)
-4. Parse the LLM's response to extract the next browser action (click/fill/navigate/etc.)
-5. Execute the action via Playwright
-6. Loop until form is submitted or the LLM says "done"
-7. Screenshot the result and log apply status to `applypilot.db`
+**Pages:**
+- **Dashboard** — pipeline stats, pending approvals, recent jobs
+- **Jobs** — filterable job bank with score/status badges
+- **Job Detail** — per-job view with description, scoring, tailored resume, cover letter, and apply controls
+- **Pipeline** — run any stage manually with live output
+- **Settings** — edit profile.json, searches.yaml, auto-search interval, Telegram config
 
 ---
 
-## 6. Troubleshooting
+## 6. Auto-Apply Agent
+
+The auto-apply agent (`agents/auto_apply.py`) uses Playwright automation powered by Ollama reasoning, with a user approval gate before any form is submitted.
+
+**Approval flow:**
+1. Jobs with tailored resume + cover letter are queued as `pending_approval`
+2. Telegram notification sent to `@bozhoapplybot` with job details
+3. User opens the Streamlit Dashboard and clicks **Approve** or **Decline**
+4. On approval: Playwright navigates to the application URL, pre-fills common fields (name, email, phone), uploads the tailored resume PDF, pastes the cover letter text
+5. User completes and submits the form manually in the browser
+6. On submit: DB updated to `applied`, Telegram confirmation sent
+
+**Playwright automation:**
+- Runs via Node.js (`playwright` npm package)
+- Launches Chrome browser in non-headless mode by default (so user can review before submitting)
+- Uses Ollama `gemma4:31b-cloud` to reason through form field identification
+- Pre-fills name/email/phone from `profile.json`, uploads resume, pastes cover letter up to 2000 chars
+- Result logged to `applypilot.db` with `applied_at` timestamp
+
+**Telegram integration:**
+- Bot: `@bozhoapplybot` (token configured in `~/.applypilot/.env`)
+- Chat ID: `7003890359`
+- Notifications sent on: job queued for approval, application submitted
+
+---
+
+## 7. Troubleshooting
 
 ### "No module named 'jobspy'"
 
@@ -379,3 +396,125 @@ db.commit()
 "
 python3 -m applypilot run score
 ```
+
+### Streamlit frontend won't start
+
+Make sure streamlit is installed:
+```bash
+pip3 install streamlit --break-system-packages
+```
+Check that the working directory is the project root when running `streamlit run`.
+
+---
+
+## 8. Finding AI Prompting Jobs — Strategy Guide
+
+Your profile has a strong combination of **business analysis + AI/ML skills**. Here's how to position yourself and get the most from ApplyPilot.
+
+### Your Best Job Titles (use in searches.yaml)
+
+| Category | Titles to search |
+|----------|-----------------|
+| Core prompt engineering | `prompt engineer`, `AI engineer`, `LLM engineer`, `AI specialist` |
+| AI + business | `AI product analyst`, `AI implementation consultant`, `AI solutions architect` |
+| AI + SaaS | `GenAI consultant SaaS`, `AI integration specialist`, `AI customer success engineer` |
+| AI operations | `AI operations specialist`, `AI data analyst`, `machine learning operations` |
+
+### How to Position Your Profile
+
+**Strengths to emphasise:**
+- 18+ years ICT market research → you understand domain complexity and can write prompts that capture nuanced requirements
+- Executive MBA + quantitative skills → you can evaluate AI outputs critically
+- Vanderbilt AI certifications (5 completed, 2 in progress) → proven AI learning trajectory
+- Vibe coding, agentic AI, LLM integration (Ollama, ChatGPT, Claude) → hands-on technical skills
+- B2B sales + consultative selling → you can communicate AI value to non-technical stakeholders
+
+**Key differentiator:** You're NOT a pure developer. You're a business-aware AI practitioner who can both use LLMs effectively AND translate AI capabilities into business outcomes. Roles like AI product analyst, AI implementation consultant, and AI solutions architect value exactly this combination.
+
+### Optimising Your Searches
+
+Edit `~/.applypilot/searches.yaml` to add these high-signal queries:
+
+```yaml
+queries:
+  # ── Tier 1: Your core target roles ─────────────────────────────────
+  - query: "prompt engineer generative AI Europe remote"
+    tier: 1
+  - query: "AI engineer LLM GPT Europe remote"
+    tier: 1
+  - query: "prompt engineering specialist AI"
+    tier: 1
+  - query: "AI product analyst GPT LLM"
+    tier: 1
+  - query: "AI operations specialist Europe"
+    tier: 1
+
+  # ── Tier 2: AI + business combo (your sweet spot) ───────────────────
+  - query: "AI implementation consultant B2B SaaS"
+    tier: 2
+  - query: "AI solutions architect business analyst Europe"
+    tier: 2
+  - query: "LLM evaluation engineer Europe remote"
+    tier: 2
+  - query: "AI customer success engineer"
+    tier: 2
+  - query: "GenAI consultant B2B SaaS Europe"
+    tier: 2
+
+  # ── Tier 3: AI adjacent ─────────────────────────────────────────────
+  - query: "AI product manager generative AI"
+    tier: 3
+  - query: "automation engineer AI workflows Europe"
+    tier: 3
+```
+
+### Location Settings (already configured)
+
+Your `searches.yaml` uses `country_indeed: "slovenia"` and `location_accept` patterns for EU countries. Keep `remote: true` on EU locations. Do NOT add US/Canada locations — your salary expectations and work authorisation point to EU roles.
+
+### What to Run and When
+
+| Action | Command | Frequency |
+|--------|---------|-----------|
+| Find new jobs | Click **🔍 Check for New Jobs** on Dashboard or `python3 -m applypilot run discover` | Daily |
+| Score new jobs | `python3 -m applypilot run score` | After each discover |
+| Tailor resumes | `python3 -m applypilot run tailor` | Weekly |
+| Generate cover letters | `python3 -m applypilot run cover` | After tailor |
+| Auto-apply | `python3 -m applypilot run apply` | As needed |
+
+### Auto-Apply Approval Flow
+
+1. Jobs with tailored resume + cover letter appear in Dashboard with **Approve / Decline** buttons
+2. Telegram notification sent to `@bozhoapplybot` when a job is queued
+3. You review in Streamlit and click **Approve** — browser opens with form pre-filled
+4. You review the pre-fill and submit manually
+5. DB updated → Telegram confirmation sent
+
+### LinkedIn Profile Tips
+
+Your LinkedIn headline should clearly communicate your AI focus. Consider updating to something like:
+> **AI & Business Analyst | Prompt Engineering, GenAI, LLM Integration | 18+ yrs ICT Market Research**
+
+Your About section should emphasise: prompt engineering skills, Vanderbilt AI certifications, hands-on experience with ChatGPT/Claude/Ollama, and your business analysis background.
+
+To fetch and review your LinkedIn profile data, click **📋 Fetch My LinkedIn Profile** in the Settings page (Chrome must be running with CDP on port 9222).
+
+### Salary Expectations for AI Prompting Roles in EU
+
+Based on your experience and location (Slovenia/EU):
+- **Entry-level prompt engineering**: €35,000–55,000
+- **Mid-level AI engineer/prompt specialist**: €50,000–75,000
+- **Senior AI product analyst / consultant**: €65,000–90,000
+- **AI solutions architect / LLM engineer**: €80,000–110,000+
+
+Your profile.json is set with `salary_range_min: 40000` and `salary_range_max: 100000` — this is reasonable. Adjust upward if targeting senior roles.
+
+### Key Companies to Target (EU AI Prompting)
+
+| Company Type | Examples |
+|-------------|---------|
+| AI-native startups | Aleph Alpha (DE), Mistral (FR), Cohere (UK), Zhipu AI (UK) |
+| Enterprise AI platforms | DataRobot, C3.ai, H2O.ai (all with EU offices) |
+| Consulting firms | Accenture AI, Deloitte AI, Capgemini (EU AI practices) |
+| SaaS companies with AI features | Salesforce (EU), HubSpot (EU), SAP (DE) |
+| Market research + analytics | Gartner, Forrester, IDC (you already know these) |

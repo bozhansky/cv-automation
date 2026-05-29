@@ -16,6 +16,19 @@ from pathlib import Path
 
 import streamlit as st
 
+# ── Tools ─────────────────────────────────────────────────────────────────────
+# cronjob from hermes_tools (available in agent context)
+try:
+    from hermes_tools import cronjob as _cronjob
+    def cronjob_safe(**kw):
+        try:
+            return _cronjob(**kw)
+        except Exception:
+            return {"jobs": []}
+except ImportError:
+    def cronjob_safe(**kw):
+        return {"jobs": []}
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 APPLYPILOT_DIR = Path.home() / ".applypilot"
 DB_PATH        = APPLYPILOT_DIR / "applypilot.db"
@@ -24,6 +37,55 @@ TAILORED_DIR   = APPLYPILOT_DIR / "tailored_resumes"
 COVER_DIR      = APPLYPILOT_DIR / "cover_letters"
 PROFILE_PATH   = APPLYPILOT_DIR / "profile.json"
 SEARCHES_PATH  = APPLYPILOT_DIR / "searches.yaml"
+AUTOSEARCH_PATH = APPLYPILOT_DIR / "autosearch.json"
+
+# ── Auto-search persistence (works outside Hermes) ─────────────────────────────
+def load_autosearch():
+    """Load auto-search config, checking system crontab as source of truth"""
+    cfg = {"enabled": False, "interval_min": 30}
+    
+    # Check system crontab for applypilot discover job
+    try:
+        import subprocess
+        crontab = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        if crontab.returncode == 0:
+            for line in crontab.stdout.split('\n'):
+                if 'applypilot' in line.lower() and 'discover' in line.lower():
+                    cfg["enabled"] = True
+                    # Extract interval (e.g., */30 or 0)
+                    if line.startswith('*/'):
+                        try:
+                            cfg["interval_min"] = int(line.split('/')[1].split()[0])
+                        except (IndexError, ValueError):
+                            pass
+                    break
+    except Exception:
+        pass
+    
+    # Merge with saved config if exists (user's toggle preference)
+    if AUTOSEARCH_PATH.exists():
+        try:
+            saved = json.loads(AUTOSEARCH_PATH.read_text())
+            cfg.update(saved)
+            # System crontab overrides file 'enabled' - it's the source of truth
+            # but we keep the file's interval_min for UI display
+        except Exception:
+            pass
+    
+    return cfg
+
+def save_autosearch(cfg: dict):
+    AUTOSEARCH_PATH.write_text(json.dumps(cfg))
+
+def fmt_discovered(val):
+    """Format discovered_at date for display"""
+    if not val:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(val).replace('Z', '+'))
+        return dt.strftime("%b %d")  # "May 28"
+    except Exception:
+        return str(val)[:10]
 
 # ── Add project agents/ to path for auto_apply module ─────────────────────────
 _PROJECT_ROOT = Path(__file__).parent.parent
@@ -96,6 +158,17 @@ def save_job_apply_status(url: str, status: str):
     )
     conn.commit()
 
+def _parse_cron_interval(schedule: str | None) -> int:
+    """Parse interval in minutes from a cron schedule string like '30m' or '2h'."""
+    if not schedule:
+        return 30
+    s = schedule.strip().lower()
+    if s.endswith('m'):
+        return int(s[:-1])
+    if s.endswith('h'):
+        return int(s[:-1]) * 60
+    return 30
+
 # ── Page config ──────────────────────────────────────────────────────────────
 PAGES = ["Dashboard", "Jobs", "Job Detail", "Pipeline", "Settings"]
 
@@ -142,7 +215,134 @@ st.sidebar.title("🎯 ApplyPilot")
 selection = st.sidebar.radio("Navigate", PAGES, index=PAGES.index(_current_page()))
 
 # ── Pages ────────────────────────────────────────────────────────────────────
+def _fetch_linkedin_profile() -> dict:
+    """Scrape LinkedIn profile using Chrome CDP with li_at cookie."""
+    import httpx
+    try:
+        import websocket  # noqa: F401
+    except ImportError:
+        return {"error": "websocket-client not installed. Run: pip3 install websocket-client --break-system-packages"}
+
+    import json, time, re
+    from pathlib import Path
+
+    APP_DIR = Path.home() / ".applypilot"
+    CHROME_WORKER = APP_DIR / "chrome-workers" / "worker-0"
+    COOKIE_FILE = CHROME_WORKER / "Default" / "Cookies"
+    PROFILE_URL = "https://www.linkedin.com/in/spisek-bostjan"  # adjust as needed
+
+    if not COOKIE_FILE.exists():
+        return {"error": "Chrome cookies not found. Run the Chrome setup first."}
+
+    try:
+        import websocket
+        ws = websocket.create_connection(
+            "ws://localhost:9222/devtools/browser",
+            timeout=10,
+        )
+    except Exception:
+        return {"error": "Cannot connect to Chrome CDP. Is Chrome running with --remote-debugging-port=9222?"}
+
+    # Navigate to LinkedIn
+    ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": PROFILE_URL}}))
+    time.sleep(4)
+
+    # Get document
+    ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {"expression": "document.documentElement.outerHTML"}}))
+    result = json.loads(ws.recv())
+    html = result.get("result", {}).get("result", {}).get("value", "")[:8000]
+    ws.close()
+
+    # Extract key sections with regex
+    data = {}
+    headline_match = re.search(r'"headline":"([^"]+)"', html)
+    if headline_match:
+        data["headline"] = headline_match.group(1)
+    name_match = re.search(r'"firstName":"([^"]+)".*?"lastName":"([^"]+)"', html)
+    if name_match:
+        data["name"] = f"{name_match.group(1)} {name_match.group(2)}"
+    about_match = re.search(r'about[^<]{0,200}<p[^>]*>([^<]+)</p>', html, re.DOTALL)
+    if about_match:
+        data["about"] = about_match.group(1)[:500]
+    data["raw_length"] = len(html)
+    return data
+
+
 def page_dashboard():
+    # ── Auto-search controls (top of dashboard) ──────────────────────────
+    st.subheader("🔄 Auto-Search")
+    ast = load_autosearch()
+
+    cron_jobs = cronjob_safe(action='list').get("jobs", [])
+    has_cron = len(cron_jobs) > 0  # Can use Hermes cron if available
+    auto_job = next((j for j in cron_jobs if j.get("name") == "Auto Job Discovery"), None)
+
+    c_search, c_toggle, c_interval, c_btn = st.columns([2, 1, 1, 1])
+
+    with c_search:
+        mins = ast.get("interval_min", 30)
+        st.caption(f"Current: every {mins}m" if ast.get("enabled") else "Off")
+
+    with c_toggle:
+        enabled = st.checkbox(
+            "Auto-Search", value=ast.get("enabled", False),
+            key="auto_search_toggle",
+        )
+
+    with c_interval:
+        interval = st.number_input(
+            "Interval (min)", min_value=5, max_value=480,
+            value=mins,
+            step=5,
+            key="auto_search_interval",
+            disabled=not enabled,
+        )
+
+    with c_btn:
+        st.write("")  # spacer
+        if st.button("💾 Save", key="save_auto_search", disabled=not enabled):
+            save_autosearch({"enabled": True, "interval_min": int(interval)})
+            # Also try to create Hermes cron job if available
+            if has_cron:
+                if auto_job:
+                    if _parse_cron_interval(auto_job.get("schedule")) != interval:
+                        cronjob_safe(action='update', job_id=auto_job["job_id"], schedule=f"{interval}m")
+                else:
+                    cronjob_safe(
+                        action='create', name="Auto Job Discovery",
+                        prompt="Run: export HOME=/home/bostjan && python3 -m applypilot run discover",
+                        schedule=f"{interval}m",
+                    )
+            st.rerun()
+
+    if not enabled and ast.get("enabled"):
+        save_autosearch({"enabled": False, "interval_min": ast.get("interval_min", 30)})
+        st.rerun()
+
+    # ── Check for new jobs (manual trigger) ────────────────────────────────
+    c_check, c_status = st.columns([1, 4])
+    with c_check:
+        if st.button("🔍 Check for New Jobs", type="primary", key="check_new_jobs"):
+            with st.spinner("Running discover stage…"):
+                output, rc = run_stage("discover", timeout=300)
+            st.session_state["last_discover_rc"] = rc
+            st.session_state["last_discover_out"] = output[-3000:]
+            st.rerun()
+
+    with c_status:
+        if "last_discover_rc" in st.session_state:
+            rc = st.session_state["last_discover_rc"]
+            out = st.session_state.get("last_discover_out", "")
+            if rc == 0:
+                st.success("✅ Discover completed")
+            else:
+                st.error(f"❌ Discover failed (exit {rc})")
+                with st.expander("Output"):
+                    st.code(out)
+
+    st.divider()
+    st.title("📊 Pipeline Dashboard")
+
     conn = get_conn()
     total    = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     scored   = conn.execute("SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL").fetchone()[0]
@@ -151,7 +351,6 @@ def page_dashboard():
     applied  = conn.execute("SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL").fetchone()[0]
     ready    = conn.execute("SELECT COUNT(*) FROM jobs WHERE fit_score >= 7").fetchone()[0]
 
-    st.title("📊 Pipeline Dashboard")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Total Jobs", total)
     c2.metric("Scored", scored)
@@ -208,7 +407,7 @@ def page_dashboard():
                 st.write(score_badge(job.get("fit_score")))
             with c2:
                 st.markdown(f"**{job.get('title', '?')}**")
-                st.caption(f"{job.get('site', '')} · {job.get('location', '')}")
+                st.caption(f"{job.get('site', '')} · {job.get('location', '')} · Found {fmt_discovered(job.get('discovered_at'))}")
             with c3:
                 opts = []
                 if job.get("tailored_resume_path"):
@@ -260,7 +459,7 @@ def page_jobs():
                 st.write(score_badge(score))
             with c2:
                 st.markdown(f"**{job.get('title', '?')}**")
-                st.caption(f"{job.get('site', '')} · {job.get('location', '')}")
+                st.caption(f"{job.get('site', '')} · {job.get('location', '')} · Found {fmt_discovered(job.get('discovered_at'))}")
             with c3:
                 opts = []
                 if job.get("tailored_resume_path"): opts.append("✅ Tailored")
@@ -396,12 +595,31 @@ def page_job_detail():
                     )
 
                 if approved:
-                    from agents.auto_apply import submit_application
-                    result = submit_application(url, approved=True)
-                    if result.get("status") == "submitted":
-                        st.success("✅ Application submitted! Check your browser.")
+                    import subprocess, os
+                    def _load_env_for_apply():
+                        env = os.environ.copy()
+                        env["HOME"] = str(Path.home())
+                        env_path = Path.home() / ".applypilot" / ".env"
+                        if env_path.exists():
+                            for line in env_path.read_text().splitlines():
+                                line = line.strip()
+                                if line and not line.startswith("#") and "=" in line:
+                                    k, v = line.split("=", 1)
+                                    env[k.strip()] = v.strip()
+                        return env
+                    result = subprocess.run(
+                        ["python3", "-m", "applypilot", "apply",
+                         "--url", url,
+                         "--limit", "1",
+                         "--headless"],
+                        capture_output=True, text=True, timeout=300,
+                        env=_load_env_for_apply(),
+                    )
+                    if result.returncode == 0:
+                        st.success("✅ Application submitted!")
                     else:
-                        st.error(f"Error: {result.get('message', 'Unknown error')}")
+                        err = result.stderr or result.stdout
+                        st.error(f"Error: {err[:300] if err else 'Unknown error'}")
                     st.rerun()
 
                 if declined:
@@ -493,6 +711,64 @@ def page_settings():
         st.code(RESUME_PATH.read_text()[:3000], language="unicode")
     else:
         st.info("resume.txt not found. Run `pdftotext` on your CV PDF to create it.")
+
+    st.divider()
+
+    # Auto-search controls
+    st.subheader("🔄 Auto-Search Setup")
+    ast = load_autosearch()
+
+    cron_jobs = cronjob_safe(action='list').get("jobs", [])
+    has_cron = len(cron_jobs) > 0
+    auto_job = next((j for j in cron_jobs if j.get("name") == "Auto Job Discovery"), None)
+
+    st.write("**Current status:**", "✅ Enabled" if ast.get("enabled") else "⏹️ Disabled")
+    st.write("**Interval:**", f"{ast.get('interval_min', 30)} minutes")
+
+    with st.expander("Manual Cron Setup (Required if running outside Hermes)"):
+        st.markdown("""
+To enable automatic job discovery, add this to your crontab:
+
+```bash
+# Edit crontab
+EDITOR=nano crontab -e
+
+# Add line (runs every X minutes, e.g., 30):
+*/30 * * * * export HOME=/home/bostjan && cd /media/bostjan/Documents/Osebno/ZAPOSLITEV/AI\ JOB\ 2026 && python3 -m applypilot run discover >> ~/.applypilot/autosearch.log 2>&1
+
+# For 60 minutes:
+0 * * * * export HOME=/home/bostjan && cd /media/bostjan/Documents/Osebno/ZAPOSLITEV/AI\ JOB\ 2026 && python3 -m applypilot run discover >> ~/.applypilot/autosearch.log 2>&1
+```
+        """)
+        st.info("The UI toggle above saves your settings so the Dashboard shows the correct status.")
+
+    st.divider()
+
+    # LinkedIn profile scraper
+    st.subheader("🔗 LinkedIn Profile Review")
+    st.caption("Uses Chrome CDP to scrape your LinkedIn profile (requires Chrome running with --remote-debugging-port=9222 and valid li_at cookie)")
+
+    col_li_btn, col_li_data = st.columns([1, 3])
+    with col_li_btn:
+        if st.button("📋 Fetch My LinkedIn Profile", key="fetch_linkedin"):
+            with st.spinner("Connecting to Chrome CDP..."):
+                data = _fetch_linkedin_profile()
+            st.session_state["linkedin_data"] = data
+            st.rerun()
+
+    if "linkedin_data" in st.session_state:
+        data = st.session_state["linkedin_data"]
+        if "error" in data:
+            st.warning(data["error"])
+        else:
+            st.success(f"✅ Fetched profile — {data.get('raw_length', 0)} chars HTML")
+            if data.get("name"):
+                st.info(f"👤 {data['name']}")
+            if data.get("headline"):
+                st.info(f"💼 {data['headline']}")
+            if data.get("about"):
+                st.text_area("About", data["about"], height=150, label_visibility="collapsed")
+            st.caption("Note: LinkedIn heavily dynamically loads profile content. For best results, open your profile in the CDP Chrome tab first, then run fetch.")
 
     st.divider()
 
