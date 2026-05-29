@@ -1,0 +1,14 @@
+searches:
+  - name: "EU Remote - SaaS & Market Research"
+    queries:
+      - "SaaS market research analyst remote Europe"
+      - "business analyst digital marketing remote EU"
+      - "market research manager remote Europe"
+      - "research analyst B2B SaaS remote"
+      - "digital analytics manager remote Europe"
+    location: "Europe"
+    remote_only: true
+    sites:
+      - indeed
+      - linkedin
+      - glassdoor
