@@ -147,6 +147,18 @@ def run_stage(stage: str, timeout=600) -> tuple[str, int]:
     """Run applypilot stage. Returns (output, returncode)."""
     env = os.environ.copy()
     env["HOME"] = str(Path.home())
+    
+    # Handle custom stages
+    if stage == "cover_sl":
+        # Run Slovenian cover letter generation
+        res = subprocess.run(
+            ["python3", str(Path(__file__).parent.parent / "agents" / "cover_letter_multilingual.py")],
+            capture_output=True, text=True, timeout=timeout,
+            cwd=str(Path.home()), env=env,
+        )
+        return res.stdout + res.stderr, res.returncode
+    
+    # Standard applypilot stages
     res = subprocess.run(
         ["python3", "-m", "applypilot", "run", stage],
         capture_output=True, text=True, timeout=timeout,
@@ -659,7 +671,8 @@ def page_pipeline():
         ("enrich",    "Enrich Details",       "Fetch full job descriptions"),
         ("score",     "Score Jobs",           "Rate jobs 1-10 using resume + Ollama"),
         ("tailor",    "Tailor Resume",        "Rewrite resume bullets for score ≥ 7 jobs"),
-        ("cover",     "Write Cover Letter",   "Generate personalised cover letters"),
+        ("cover",     "Write Cover Letter",   "Generate personalised cover letters (English)"),
+        ("cover_sl",  "Write Cover Letter (SL)", "Generate Slovenian cover letters for mojedelo jobs"),
         ("pdf",       "Export PDF",           "Convert to PDF"),
     ]
 
