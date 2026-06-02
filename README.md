@@ -383,14 +383,48 @@ Or use the provided launcher:
 ```
 
 **Pages:**
-- **Dashboard** — pipeline stats, pending approvals, recent jobs
+- **Dashboard** — pipeline stats, pending approvals, **filterable job list with dates + per-row delete**
 - **Jobs** — filterable job bank with score/status badges
 - **Job Detail** — per-job view with description, scoring, tailored resume, cover letter, and apply controls
 - **Pipeline** — run any stage manually with live output. Also has three sub-sections:
   - **🚀 Run Whole Pipeline** — one-click `run all` with min-score, `--since` window, and confirm checkbox
   - **🎯 On-Demand: Tailor / Cover a Single Job** — paste a URL and trigger tailor/cover for one job
   - **🗑️ Purge Old Jobs** — UI for the weekly purge with days/applied/approved controls
+- **Site Analytics** — per-site success rate (4.9), dynamic blacklist (4.10), form schema cache (4.8), Telegram status (4.6)
 - **Settings** — edit profile.json, searches.yaml, auto-search interval, Telegram config
+
+### Dashboard filters + delete
+
+The Dashboard's job list (under "🗂️ Jobs") supports filtering and per-row deletion:
+
+**Filters** (open the 🔍 Filters expander):
+- **Site** — dropdown of all sites in DB (default: all)
+- **Title contains** — case-insensitive text search on job title
+- **Discovered from / to** — date range for `discovered_at`
+- **Applied from / to** — date range for `applied_at`
+- **Fit score range** — slider 0-10
+- **Only applied jobs** — checkbox to filter to `applied_at IS NOT NULL`
+- **Max rows** — pagination control (default 100)
+- **🔄 Reset filters** — clears all
+
+**Per-row display** (in addition to title/site/location):
+- 🔍 **Discovered**: full date + time
+- ✅ **Applied**: full date + time (or `—` if not yet applied)
+- Tailoring/cover status (✅/⬜)
+- **View** button → Job Detail page
+- **🗑️ Delete** button → 2-step confirmation → also deletes the tailored/cover PDFs from disk
+
+**Filter SQL example** (for reference; the Streamlit code builds the same):
+```sql
+SELECT * FROM jobs
+WHERE site = 'linkedin'
+  AND LOWER(title) LIKE '%prompt engineer%'
+  AND discovered_at >= '2026-05-01' AND discovered_at < '2026-06-01'
+  AND fit_score BETWEEN 7 AND 10
+  AND applied_at IS NOT NULL
+ORDER BY fit_score DESC NULLS LAST, discovered_at DESC NULLS LAST
+LIMIT 100;
+```
 
 ### Dashboard approval & preservation
 

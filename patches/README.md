@@ -21,10 +21,12 @@ We track our patches here in this repo so they can be:
 |---|---|---|
 | `cli.py` | On-demand subcommands + sites analytics | Added `tailor`, `cover`, `packet`, `purge`, `sites` subcommands; threaded `--since` through `run`; flipped streaming default ON; added `--stream/--no-stream` |
 | `database.py` | Schema migrations + URL dedup + per-site analytics + dynamic blacklist | `ensure_columns()` for `approved_at`/`apply_cost_usd`; `ensure_indexes()`; `_canonicalize_url()`; `purge_old_jobs()`; `get_site_stats()`; `get_dynamic_blacklist()`; `is_site_blacklisted()`; `get_blacklist_as_dict()` |
-| `apply/launcher.py` | Apply-stage safety rails | `preflight_check()` upgraded (existence + size + PDF header + path safety); `mark_result()` now fires `notify_applied`; cost stored to `apply_cost_usd`; 3-tuple return; dry-run marks `dry_run_ok`; `_run_job_ollama()` plumbs `dry_run` |
+| `apply/launcher.py` | Apply-stage safety rails | `preflight_check()` upgraded (existence + size + PDF header + path safety); `mark_result()` now fires `notify_applied`; cost stored to `apply_cost_usd`; 3-tuple return; dry-run marks `dry_run_ok`; `_run_job_ollama()` plumbs `dry_run`; `_run_job_mcp()` MCP fallback dispatcher |
 | `apply/ollama_agent.py` | Submit gate (4.1) + cost cap (4.2) | Added `submit_application` tool with screenshot gate; `_screenshot_taken_this_turn` flag; per-turn cost cap; `dry_run` plumbing |
-| `apply/prompt.py` | Better submit instructions | Updated `submit_instruction` for both dry-run and live paths to use the new gate |
-| `apply/notifier.py` | NEW — Telegram notifications | `notify_applied()`, `notify_failed()`, threaded send, env-var-driven config |
+| `apply/prompt.py` | Better submit instructions + cached form schema injection | Updated `submit_instruction` for both dry-run and live paths to use the new gate; injects `{cached_schema_section}` for known sites |
+| `apply/notifier.py` | NEW — Telegram notifications | `notify_applied()`, `notify_failed()`, threaded send, env-var-driven config (supports both `TELEGRAM_*` and `APPLY_TELEGRAM_*` env var names) |
+| `apply/mcp_fallback.py` | NEW — MCP Playwright fallback (4.5) | `is_mcp_available()`, `discover_mcp_server()`, `mcp_status()`, `get_mcp_tools()`; activated by `APPLY_AGENT=mcp` |
+| `apply/form_schema_cache.py` | NEW — Per-site form schema cache (4.8) | `get_schema()`, `save_schema()`, `update_usage()`, `prune_stale()`, `get_schema_for_prompt()`; caches field selectors per site |
 
 ## Re-apply script
 

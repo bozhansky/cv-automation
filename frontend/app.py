@@ -87,6 +87,141 @@ def fmt_discovered(val):
     except Exception:
         return str(val)[:10]
 
+
+def fmt_date_full(val) -> str:
+    """Format any date column for display. Returns 'May 28, 14:30' or '—' if None."""
+    if not val:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(str(val).replace('Z', '+'))
+        return dt.strftime("%b %d, %H:%M")
+    except Exception:
+        return str(val)[:16]
+
+
+def fmt_date_only(val) -> str:
+    """Format any date column as YYYY-MM-DD for date inputs / filtering."""
+    if not val:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(val).replace('Z', '+'))
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return str(val)[:10]
+
+
+def _parse_iso_date(s: str | None):
+    """Parse YYYY-MM-DD string into datetime (or None). Used by date filters."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def get_filtered_jobs(
+    site: str | None = None,
+    title_contains: str | None = None,
+    discovered_from: str | None = None,
+    discovered_to: str | None = None,
+    score_min: float | None = None,
+    score_max: float | None = None,
+    applied_from: str | None = None,
+    applied_to: str | None = None,
+    applied_only: bool = False,
+    limit: int = 500,
+) -> list[dict]:
+    """Return jobs matching all the given filters. Empty filter = no constraint.
+
+    Args:
+        site: Exact site match (e.g. 'linkedin')
+        title_contains: Case-insensitive substring match on title
+        discovered_from / discovered_to: YYYY-MM-DD inclusive bounds on discovered_at
+        score_min / score_max: Inclusive bounds on fit_score (NULLs are kept)
+        applied_from / applied_to: YYYY-MM-DD inclusive bounds on applied_at
+        applied_only: If True, restrict to jobs with applied_at NOT NULL
+        limit: Max rows to return
+
+    Returns:
+        List of job dicts ordered by fit_score DESC, discovered_at DESC.
+    """
+    conn = get_conn()
+    where = []
+    args: list = []
+    if site and site != "(all)":
+        where.append("site = ?")
+        args.append(site)
+    if title_contains:
+        where.append("LOWER(title) LIKE ?")
+        args.append(f"%{title_contains.lower()}%")
+    df = _parse_iso_date(discovered_from)
+    if df:
+        where.append("discovered_at >= ?")
+        args.append(df.isoformat())
+    dt = _parse_iso_date(discovered_to)
+    if dt:
+        # inclusive — bump by 1 day and use < so the whole day is included
+        from datetime import timedelta as _td
+        where.append("discovered_at < ?")
+        args.append((dt + _td(days=1)).isoformat())
+    if score_min is not None:
+        where.append("fit_score >= ?")
+        args.append(score_min)
+    if score_max is not None:
+        where.append("fit_score <= ?")
+        args.append(score_max)
+    af = _parse_iso_date(applied_from)
+    if af:
+        where.append("applied_at >= ?")
+        args.append(af.isoformat())
+    at = _parse_iso_date(applied_to)
+    if at:
+        from datetime import timedelta as _td
+        where.append("applied_at < ?")
+        args.append((at + _td(days=1)).isoformat())
+    if applied_only:
+        where.append("applied_at IS NOT NULL")
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = conn.execute(
+        f"SELECT * FROM jobs {where_sql} ORDER BY fit_score DESC NULLS LAST, "
+        f"discovered_at DESC NULLS LAST LIMIT ?",
+        (*args, limit),
+    ).fetchall()
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def delete_job_by_url(url: str) -> tuple[bool, str]:
+    """Delete a job from the DB. Also tries to delete its tailored/cover files
+    from disk. Returns (success, message)."""
+    if not url:
+        return False, "No URL provided"
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT tailored_resume_path, cover_letter_path FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    if not row:
+        return False, "Job not found in DB"
+    files_deleted = []
+    for path_str in row:
+        if path_str:
+            try:
+                p = Path(path_str)
+                if p.exists() and p.is_file():
+                    p.unlink()
+                    files_deleted.append(str(p))
+            except OSError as e:
+                # Don't fail the delete just because file removal failed
+                pass
+    conn.execute("DELETE FROM jobs WHERE url = ?", (url,))
+    conn.commit()
+    msg = f"Deleted job {url[:60]}..."
+    if files_deleted:
+        msg += f" (+ {len(files_deleted)} file(s))"
+    return True, msg
+
 # ── Add project agents/ to path for auto_apply module ─────────────────────────
 _PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -186,7 +321,7 @@ def _parse_cron_interval(schedule: str | None) -> int:
     return 30
 
 # ── Page config ──────────────────────────────────────────────────────────────
-PAGES = ["Dashboard", "Jobs", "Job Detail", "Pipeline", "Settings"]
+PAGES = ["Dashboard", "Jobs", "Job Detail", "Pipeline", "Site Analytics", "Settings"]
 
 def _set_page(page: str):
     st.query_params["page"] = page
@@ -414,34 +549,148 @@ def page_dashboard():
         st.caption("No pending approvals.")
 
     st.divider()
-    st.subheader("Recent Jobs")
-    recent = all_jobs(sort_by="score")[:10]
-    for job in recent:
-        with st.container():
-            c1, c2, c3, c4 = st.columns([1, 4, 2, 1])
-            with c1:
-                st.write(score_badge(job.get("fit_score")))
-            with c2:
-                st.markdown(f"**{job.get('title', '?')}**")
-                st.caption(f"{job.get('site', '')} · {job.get('location', '')} · Found {fmt_discovered(job.get('discovered_at'))}")
-            with c3:
-                opts = []
-                if job.get("tailored_resume_path"):
-                    opts.append("✅ Tailored")
-                else:
-                    opts.append("⬜ Not tailored")
-                if job.get("cover_letter_path"):
-                    opts.append("✅ Cover")
-                else:
-                    opts.append("⬜ No cover")
-                st.caption(" · ".join(opts))
-            with c4:
-                url = job.get("url", "")
-                uk = hashlib.sha1(url.encode()).hexdigest()[:12]
-                if st.button("View", key=f"dv_{uk}"):
-                    st.query_params["job"] = url
-                    st.query_params["page"] = "Job Detail"
-                    st.rerun()
+    st.subheader("🗂️ Jobs (filtered, deletable)")
+
+    # ── Filters ─────────────────────────────────────────────────────────
+    conn = get_conn()
+    all_sites = [r[0] for r in conn.execute(
+        "SELECT DISTINCT site FROM jobs WHERE site IS NOT NULL AND site != '' ORDER BY site"
+    ).fetchall()]
+
+    with st.expander("🔍 Filters", expanded=False):
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            f_site = st.selectbox("Site", options=["(all)"] + all_sites, index=0, key="dash_f_site")
+            f_title = st.text_input("Title contains", value="", key="dash_f_title",
+                                     placeholder="e.g. prompt engineer")
+        with f2:
+            f_disc_from = st.date_input("Discovered from", value=None, key="dash_f_disc_from")
+            f_disc_to = st.date_input("Discovered to", value=None, key="dash_f_disc_to")
+        with f3:
+            f_score_range = st.slider("Fit score range", min_value=0, max_value=10,
+                                      value=(0, 10), step=1, key="dash_f_score")
+            f_applied_only = st.checkbox("Only applied jobs", value=False, key="dash_f_applied_only")
+
+        f4, f5, _ = st.columns([1, 1, 2])
+        with f4:
+            f_app_from = st.date_input("Applied from", value=None, key="dash_f_app_from")
+        with f5:
+            f_app_to = st.date_input("Applied to", value=None, key="dash_f_app_to")
+
+        fc1, fc2, _ = st.columns([1, 1, 4])
+        with fc1:
+            if st.button("🔄 Reset filters", key="dash_f_reset"):
+                for k in ("dash_f_site", "dash_f_title", "dash_f_disc_from", "dash_f_disc_to",
+                          "dash_f_score", "dash_f_applied_only", "dash_f_app_from", "dash_f_app_to"):
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.rerun()
+        with fc2:
+            f_limit = st.number_input("Max rows", min_value=10, max_value=2000, value=100,
+                                      step=50, key="dash_f_limit")
+
+    # Build the filter dict
+    score_min, score_max = f_score_range
+    df_str = f_disc_from.isoformat() if f_disc_from else None
+    dt_str = f_disc_to.isoformat() if f_disc_to else None
+    af_str = f_app_from.isoformat() if f_app_from else None
+    at_str = f_app_to.isoformat() if f_app_to else None
+
+    jobs = get_filtered_jobs(
+        site=f_site,
+        title_contains=f_title.strip() or None,
+        discovered_from=df_str,
+        discovered_to=dt_str,
+        score_min=float(score_min) if score_min > 0 else None,
+        score_max=float(score_max) if score_max < 10 else None,
+        applied_from=af_str,
+        applied_to=at_str,
+        applied_only=f_applied_only,
+        limit=int(f_limit),
+    )
+
+    # Summary line
+    active_filters = []
+    if f_site and f_site != "(all)":
+        active_filters.append(f"site={f_site}")
+    if f_title.strip():
+        active_filters.append(f"title~'{f_title.strip()}'")
+    if df_str or dt_str:
+        active_filters.append(f"discovered {df_str or '…'} → {dt_str or '…'}")
+    if score_min > 0 or score_max < 10:
+        active_filters.append(f"score {score_min}-{score_max}")
+    if af_str or at_str:
+        active_filters.append(f"applied {af_str or '…'} → {at_str or '…'}")
+    if f_applied_only:
+        active_filters.append("applied only")
+    filter_str = " · ".join(active_filters) if active_filters else "no filters"
+    st.caption(f"Showing **{len(jobs)}** jobs · {filter_str}")
+
+    if not jobs:
+        st.info("No jobs match the current filters. Try widening the criteria or click 🔄 Reset filters.")
+    else:
+        # Render each job
+        for job in jobs:
+            url = job.get("url", "") or ""
+            uk = hashlib.sha1(url.encode()).hexdigest()[:12]
+            with st.container():
+                c1, c2, c3, c4, c5 = st.columns([1, 4, 2, 2, 1])
+                with c1:
+                    st.write(score_badge(job.get("fit_score")))
+                with c2:
+                    title = job.get("title", "?")
+                    st.markdown(f"**{title}**")
+                    site = job.get("site", "") or "?"
+                    location = job.get("location", "") or ""
+                    st.caption(f"🌐 {site}" + (f" · 📍 {location}" if location else ""))
+                with c3:
+                    # Discovery + application dates
+                    disc = fmt_date_full(job.get("discovered_at"))
+                    st.caption(f"🔍 Discovered: **{disc}**")
+                    app = job.get("applied_at")
+                    if app:
+                        st.caption(f"✅ Applied: **{fmt_date_full(app)}**")
+                    else:
+                        st.caption("✅ Applied: —")
+                with c4:
+                    # Tailoring / cover status
+                    opts = []
+                    if job.get("tailored_resume_path"):
+                        opts.append("✅ Tailored")
+                    else:
+                        opts.append("⬜ Not tailored")
+                    if job.get("cover_letter_path"):
+                        opts.append("✅ Cover")
+                    else:
+                        opts.append("⬜ No cover")
+                    st.caption(" · ".join(opts))
+                with c5:
+                    if st.button("View", key=f"dv_{uk}"):
+                        st.query_params["job"] = url
+                        st.query_params["page"] = "Job Detail"
+                        st.rerun()
+            # Per-row delete confirmation (own container for clean layout)
+            with st.container():
+                _, dc1, dc2 = st.columns([7, 1, 1])
+                with dc1:
+                    confirm_key = f"dc_c_{uk}"
+                    confirmed = st.session_state.get(confirm_key, False)
+                    if not confirmed:
+                        if st.button("🗑️ Delete", key=f"dc_btn_{uk}"):
+                            st.session_state[confirm_key] = True
+                            st.rerun()
+                    else:
+                        st.warning("Confirm?")
+                with dc2:
+                    if st.session_state.get(confirm_key, False):
+                        if st.button("Yes, delete", key=f"dc_yes_{uk}", type="primary"):
+                            ok, msg = delete_job_by_url(url)
+                            if ok:
+                                st.success(msg)
+                            else:
+                                st.error(msg)
+                            del st.session_state[confirm_key]
+                            st.rerun()
             st.divider()
 
 def page_jobs():
@@ -1062,6 +1311,181 @@ TELEGRAM_CHAT_ID=your_chat_id
             st.error(f"Reset failed: {e}")
 
 
+def page_site_analytics():
+    """Per-site success-rate analytics (4.9) + dynamic blacklist (4.10) + form schema cache (4.8) + Telegram status (4.6)."""
+    st.title("📊 Site Analytics & Safety Rails")
+    st.caption("Per-site apply success rate, dynamic blacklist, form schema cache, and Telegram notifier status.")
+
+    try:
+        from applypilot.database import (
+            get_site_stats, get_dynamic_blacklist,
+            is_site_blacklisted, get_blacklist_as_dict,
+        )
+        from applypilot.apply.form_schema_cache import get_cache_stats, get_schema, get_schema_for_prompt
+        from applypilot.apply.notifier import _load_creds, reset_cache as reset_notifier_cache
+    except ImportError as e:
+        st.error(f"Could not import applypilot modules: {e}\n\nMake sure you're running from the applypilot Python environment.")
+        return
+
+    # ----- Controls -----
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        days = st.number_input("Look-back window (days)", min_value=1, max_value=365, value=30, step=1)
+    with col2:
+        min_attempts = st.number_input("Min attempts per site", min_value=1, max_value=100, value=3, step=1)
+    with col3:
+        env_blacklist_on = os.environ.get("APPLY_ENABLE_BLACKLIST", "").strip() in ("1", "true", "yes")
+        st.metric("Blacklist env", "ON ✅" if env_blacklist_on else "OFF ⏸️",
+                  delta="APPLY_ENABLE_BLACKLIST=1" if not env_blacklist_on else "active",
+                  delta_color="off")
+
+    st.divider()
+
+    # ----- Section 1: Telegram status (4.6) -----
+    st.subheader("📨 Telegram Notifier (4.6)")
+    token, chat_id = _load_creds()
+    col_t1, col_t2 = st.columns([3, 1])
+    with col_t1:
+        if token and chat_id:
+            masked_t = token[:8] + "..." + token[-4:] if len(token) > 12 else "(short)"
+            st.success(f"✅ Telegram configured — bot token `{masked_t}`, chat_id `{chat_id}`")
+            # Test send
+            test_msg = st.text_input("Test message", "✅ ApplyPilot dashboard test")
+            if st.button("📨 Send test message", key="tg_test"):
+                from applypilot.apply.notifier import _send_telegram_message
+                ok = _send_telegram_message(token, chat_id, test_msg)
+                if ok:
+                    st.success("Sent! Check your Telegram.")
+                else:
+                    st.error("Send failed — check token/chat_id and network.")
+        else:
+            missing = []
+            if not token:
+                missing.append("TELEGRAM_BOT_TOKEN (or APPLY_TELEGRAM_BOT_TOKEN)")
+            if not chat_id:
+                missing.append("TELEGRAM_CHAT_ID (or APPLY_TELEGRAM_CHAT_ID)")
+            st.error(f"❌ Telegram not configured. Missing: {', '.join(missing)}")
+            st.markdown("""
+**How to configure:**
+1. Open Telegram, search for `@BotFather`, send `/newbot`
+2. Get your bot token (e.g. `1234567890:AAF...`)
+3. Send any message to your new bot, then visit:
+   `https://api.telegram.org/bot<TOKEN>/getUpdates` and find `"chat":{"id":...}`
+4. Add to `~/.applypilot/.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=<paste token>
+   TELEGRAM_CHAT_ID=<numeric id>
+   ```
+""")
+    with col_t2:
+        if st.button("🔄 Reload creds", key="tg_reload"):
+            reset_notifier_cache()
+            st.rerun()
+
+    st.divider()
+
+    # ----- Section 2: Per-site stats table (4.9) -----
+    st.subheader(f"🌐 Per-Site Success Rate (last {days} days, min {min_attempts} attempts) — 4.9")
+    try:
+        sites_data = get_site_stats(days=days, min_attempts=min_attempts)
+    except Exception as e:
+        st.error(f"Failed to load site stats: {e}")
+        sites_data = []
+
+    if not sites_data:
+        st.info(f"No sites have at least {min_attempts} apply attempts in the last {days} days. Lower the min or run more applies.")
+    else:
+        # Build a pandas dataframe for nice display
+        import pandas as pd
+        rows = []
+        for s in sites_data:
+            failed_total = s["failed"] + s["expired"] + s["captcha"] + s["login_issue"]
+            rows.append({
+                "Site": s["site"],
+                "Attempts": s["attempts"],
+                "Applied": s["applied"],
+                "Failed": failed_total,
+                "Success %": f"{s['success_rate']*100:.0f}%",
+                "Streak": s["recent_failure_streak"],
+                "Status": "🚫 BLACKLISTED" if (s["failure_rate"] > 0.85 and s["recent_failure_streak"] >= 3) else "✅ OK",
+            })
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ----- Section 3: Dynamic blacklist (4.10) -----
+    st.subheader("🚫 Dynamic Blacklist — 4.10")
+    try:
+        blacklist = get_dynamic_blacklist(days=days, min_attempts=min_attempts)
+    except Exception as e:
+        st.error(f"Failed to compute blacklist: {e}")
+        blacklist = []
+
+    col_b1, col_b2 = st.columns([3, 1])
+    with col_b1:
+        if blacklist:
+            st.warning(f"**{len(blacklist)} site(s) currently blacklisted** (failure rate > 85% AND streak ≥ 3):")
+            for entry in blacklist:
+                with st.expander(f"🚫 {entry['site']} — {entry['failure_rate']*100:.0f}% fail rate, {entry['recent_failure_streak']}-streak, {entry['attempts']} attempts"):
+                    st.markdown(f"""
+- **Site:** `{entry['site']}`
+- **Attempts:** {entry['attempts']}
+- **Applied:** {entry['applied']}
+- **Failed:** {entry['failed']} | **Expired:** {entry['expired']} | **Captcha:** {entry['captcha']} | **Login issue:** {entry['login_issue']}
+- **Success rate:** {entry['success_rate']*100:.1f}%
+- **Failure rate:** {entry['failure_rate']*100:.1f}%
+- **Recent failure streak:** {entry['recent_failure_streak']}
+""")
+        else:
+            st.success("✅ No sites currently blacklisted.")
+    with col_b2:
+        st.markdown("**Tune thresholds (env vars):**")
+        st.code("""APPLY_BLACKLIST_FAILURE_THRESHOLD=0.85
+APPLY_BLACKLIST_STREAK_THRESHOLD=3
+APPLY_BLACKLIST_DAYS=30
+APPLY_BLACKLIST_MIN_ATTEMPTS=3
+APPLY_ENABLE_BLACKLIST=1   # turn on""", language="bash")
+
+    st.divider()
+
+    # ----- Section 4: Form schema cache (4.8) -----
+    st.subheader("🗂️ Form Schema Cache — 4.8")
+    try:
+        cache_stats = get_cache_stats()
+    except Exception as e:
+        st.error(f"Failed to load cache stats: {e}")
+        cache_stats = {"total_sites": 0, "total_uses": 0, "total_successes": 0,
+                       "total_failures": 0, "overall_success_rate": 0.0, "sites": []}
+
+    col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+    col_c1.metric("Sites cached", cache_stats["total_sites"])
+    col_c2.metric("Total uses", cache_stats["total_uses"])
+    col_c3.metric("Cache successes", cache_stats["total_successes"])
+    col_c4.metric("Cache success rate", f"{cache_stats['overall_success_rate']*100:.0f}%")
+
+    if cache_stats["sites"]:
+        st.markdown("**Cached sites:**")
+        cols = st.columns(min(4, len(cache_stats["sites"])))
+        for i, site in enumerate(cache_stats["sites"]):
+            with cols[i % len(cols)]:
+                schema = get_schema(site)
+                if schema:
+                    st.markdown(f"**{site}** — uses={schema.get('uses', 0)}, "
+                                f"✅{schema.get('successes', 0)} / ❌{schema.get('failures', 0)}")
+                    with st.expander(f"View schema for {site}"):
+                        st.code(get_schema_for_prompt(site), language="markdown")
+    else:
+        st.info("No form schemas cached yet. They populate automatically as the apply agent learns each site's form structure.")
+
+    # Prune button
+    if st.button("🧹 Prune stale entries (>30d, no successes)", key="fsc_prune"):
+        from applypilot.apply.form_schema_cache import prune_stale
+        n = prune_stale(threshold_days=30, min_attempts=3)
+        st.success(f"Pruned {n} stale entries.")
+        st.rerun()
+
+
 if selection == "Dashboard":
     page_dashboard()
 elif selection == "Jobs":
@@ -1070,5 +1494,7 @@ elif selection == "Job Detail":
     page_job_detail()
 elif selection == "Pipeline":
     page_pipeline()
+elif selection == "Site Analytics":
+    page_site_analytics()
 elif selection == "Settings":
     page_settings()
