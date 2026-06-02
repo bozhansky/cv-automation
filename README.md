@@ -319,9 +319,14 @@ python3 -m applypilot tailor "https://www.linkedin.com/jobs/view/4417252427"
 # Re-generate cover letter for a single job
 python3 -m applypilot cover  "https://www.linkedin.com/jobs/view/4417252427"
 
+# Build a combined resume+cover PDF packet for one job
+python3 -m applypilot packet "https://www.linkedin.com/jobs/view/4417252427"
+
 # Or pipeline a new URL not yet in the DB: discover -> score -> tailor -> cover
 # (use the Streamlit Pipeline page for the GUI; CLI: `python3 -m applypilot run all --since 24h`)
 ```
+
+**Note:** The on-demand `tailor` / `cover` subcommands call the per-job functions directly, not the batch `run_tailoring()` / `run_cover_letters()`. They use the same LLM prompts, validator, and AI-signal sanitizer, but skip the batch loop's metadata tracking. New validation rules added to the batch path won't auto-apply to on-demand — keep the batch path as the source of truth.
 
 ### Purge Old Jobs
 
@@ -417,6 +422,21 @@ The auto-apply agent (`agents/auto_apply.py`) uses Playwright automation powered
 - Chat ID: `7003890359`
 - Notifications sent on: job queued for approval, application submitted
 
+**Apply-stage safety rails (4.1–4.10):**
+
+The apply agent is wrapped in several safety layers that fire BEFORE any Submit/Apply click. All failures are recorded as `apply_status` and surface in the Dashboard — nothing is silently dropped.
+
+| Layer | What it catches | Config |
+|---|---|---|
+| **Preflight** (4.3) | Missing tailored PDF / cover PDF, 0-byte files, non-PDF header, bad URL, fit_score < 7, path outside data dir | `APPLY_SKIP_FILE_CHECK=1` to disable file checks |
+| **Submit gate** (4.1) | Agent must call `browser_take_screenshot` immediately before `submit_application`. Other tool calls between screenshot and submit reset the gate. Also refuses in dry-run. | Built-in |
+| **Dry-run DB protection** (4.4) | `--dry-run` jobs are marked `dry_run_ok` (not `applied`) so the DB stays clean | `--dry-run` flag |
+| **Per-job cost cap** (4.2) | Aborts an apply turn if estimated cost exceeds `APPLY_MAX_COST_PER_JOB` (default $0.50, $3/M input + $15/M output) | `APPLY_MAX_COST_PER_JOB=0` to disable |
+| **Missing file detection** (4.7) | Extends preflight: existence + non-zero size + `%PDF-` magic header + path-safety check | Built-in |
+| **Dynamic blacklist** (4.10) | Auto-skips sites with > 85 % failure rate AND ≥ 3-streak in the last 30 days (configurable) | `APPLY_ENABLE_BLACKLIST=1` to turn on; `APPLY_BLACKLIST_FAILURE_THRESHOLD`, `APPLY_BLACKLIST_STREAK_THRESHOLD`, `APPLY_BLACKLIST_DAYS`, `APPLY_BLACKLIST_MIN_ATTEMPTS` to tune |
+| **MCP fallback** (4.5) | If the local Ollama agent loop is unavailable, falls back to a Playwright MCP server if installed | Built-in detection |
+| **Per-site form schema cache** (4.8) | Once a site's form structure is learned, it's cached and re-used on subsequent applies (saves 2-3 turns of discovery) | Built-in |
+
 ---
 
 ## 7. Maintenance: Purge, Cron, DB Indexes
@@ -445,6 +465,53 @@ The jobs table has 26 columns. When new ones are added (e.g. `approved_at`), `en
 ### Watchdog (orphan-process prevention)
 
 The 4-hourly discover cron uses `flock -n` on `/tmp/applypilot_discover.lock` to prevent stacking. If a previous discover is still running, the new tick exits immediately (logs "Another discover is already running — skipping"). The lock auto-releases when the process exits (no stale lockfiles).
+
+### Per-site analytics (4.9) & dynamic blacklist (4.10)
+
+ApplyPilot tracks apply success rate per site and uses it to auto-skip broken ones.
+
+```bash
+# Show all sites with their success rate (last 30 days, min 3 attempts)
+python3 -m applypilot sites
+
+# Only show blacklisted sites
+python3 -m applypilot sites --blacklist
+
+# Adjust the look-back window / min attempts / thresholds
+python3 -m applypilot sites --days 60 --min-attempts 5
+python3 -m applypilot sites --blacklist --days 7
+
+# JSON output for piping
+python3 -m applypilot sites --json | jq
+```
+
+**A site is blacklisted when BOTH conditions hold** (defaults shown):
+- failure_rate > 0.85 in the last 30 days
+- recent_failure_streak ≥ 3 consecutive failures
+
+**Tunable env vars** (read on every call, no restart):
+- `APPLY_BLACKLIST_FAILURE_THRESHOLD` (default `0.85`)
+- `APPLY_BLACKLIST_STREAK_THRESHOLD` (default `3`)
+- `APPLY_BLACKLIST_DAYS` (default `30`)
+- `APPLY_BLACKLIST_MIN_ATTEMPTS` (default `3`)
+
+**To turn on auto-skip in preflight:**
+```bash
+export APPLY_ENABLE_BLACKLIST=1   # add to ~/.applypilot/.env for permanent
+```
+
+Programmatic access (for scripts / UI):
+```python
+from applypilot.database import (
+    get_site_stats, get_dynamic_blacklist,
+    is_site_blacklisted, get_blacklist_as_dict,
+)
+# returns: [{site, attempts, applied, failed, expired, captcha, login_issue,
+#            dry_run, success_rate, failure_rate, recent_failure_streak}]
+stats = get_site_stats(days=30, min_attempts=3)
+bl = get_dynamic_blacklist()  # subset of stats
+blacklisted, reason = is_site_blacklisted("linkedin")
+```
 
 ### Manual intervention
 
