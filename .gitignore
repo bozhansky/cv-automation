@@ -17,6 +17,7 @@ chrome-workers/
 cover_letters/
 tailored_resumes/
 logs/
+patches/.backups/
 
 # Node / JavaScript
 node_modules/
