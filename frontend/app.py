@@ -702,6 +702,139 @@ def page_pipeline():
                     st.error(f"`{stage}` failed (exit {last_rc[0]}).")
             last_out[0], last_rc[0] = None, None
 
+    st.divider()
+
+    # ── Custom URL pipeline ──────────────────────────────────────────────────
+    st.subheader("🔗 Custom URL Pipeline")
+    st.caption("Paste a job URL and run the full pipeline (insert → enrich → score → tailor → cover) on it.")
+
+    with st.form("custom_url_form", clear_on_submit=False):
+        url = st.text_input(
+            "Job URL",
+            placeholder="https://app.welcometothejungle.com/jobs/xxxxx",
+            help="Any job URL — WTTJ, LinkedIn, Indeed, mojedelo, or any career page.",
+        )
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            run_enrich  = st.checkbox("Enrich (fetch description)", value=True)
+        with col2:
+            run_score   = st.checkbox("Score (1-10 fit)",           value=True)
+        with col3:
+            run_tailor  = st.checkbox("Tailor + Cover (if score ≥ 7)", value=True)
+
+        submitted = st.form_submit_button("🚀 Run pipeline on URL", type="primary")
+
+    if submitted:
+        if not url or not url.strip().startswith(("http://", "https://")):
+            st.error("Please enter a valid URL starting with http:// or https://")
+        else:
+            _run_custom_url_pipeline(url.strip(), run_enrich, run_score, run_tailor)
+
+
+def _run_custom_url_pipeline(url: str, do_enrich: bool, do_score: bool, do_tailor: bool):
+    """Insert a custom URL into the DB and run downstream pipeline stages."""
+    import sqlite3
+    from datetime import datetime, timezone
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Detect site label from URL hostname
+    from urllib.parse import urlparse
+    host = urlparse(url).hostname or ""
+    site_map = {
+        "welcometothejungle.com": "welcometothejungle",
+        "mojedelo.com":           "mojedelo",
+        "weworkremotely.com":     "weworkremotely",
+        "linkedin.com":           "linkedin",
+        "indeed.com":             "indeed",
+        "glassdoor.com":          "glassdoor",
+        "google.com":             "google",
+    }
+    site_label = next((v for k, v in site_map.items() if k in host), host or "manual")
+
+    # Try to extract a job title from the URL slug
+    title_guess = ""
+    try:
+        from urllib.parse import unquote
+        path = urlparse(url).path
+        # last non-empty path segment
+        parts = [p for p in path.split("/") if p and p not in ("jobs", "job", "delovno-mesto", "positions")]
+        if parts:
+            title_guess = unquote(parts[-1]).replace("-", " ").replace("_", " ")[:120].strip()
+    except Exception:
+        pass
+
+    # Insert (or update) the job
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO jobs (url, title, site, strategy, discovered_at)
+            VALUES (?, ?, ?, 'custom_url_form', ?)
+        """, (url, title_guess or "Custom URL", site_label, now))
+        conn.commit()
+        st.success(f"✅ Inserted new job: {title_guess or url}")
+    except sqlite3.IntegrityError:
+        # Already exists — reset downstream fields so we re-process
+        cur.execute("""
+            UPDATE jobs
+            SET fit_score=NULL, score_reasoning=NULL, scored_at=NULL,
+                tailored_resume_path=NULL, tailored_at=NULL, tailor_attempts=0,
+                cover_letter_path=NULL, cover_letter_at=NULL,
+                full_description=NULL, detail_scraped_at=NULL, detail_error=NULL
+            WHERE url = ?
+        """, (url,))
+        conn.commit()
+        st.info(f"ℹ️ Job already exists — reset pipeline fields. Re-running…")
+
+    conn.close()
+
+    # Run downstream stages
+    stages_run = []
+    if do_enrich:
+        with st.spinner("Enriching (fetching full description)…"):
+            out, rc = run_stage("enrich", timeout=900)
+        stages_run.append(("enrich", rc, out[-2000:]))
+    if do_score:
+        with st.spinner("Scoring (LLM fit 1-10)…"):
+            out, rc = run_stage("score", timeout=600)
+        stages_run.append(("score", rc, out[-2000:]))
+    if do_tailor:
+        with st.spinner("Tailoring resume + writing cover letter…"):
+            out, rc = run_stage("tailor", timeout=600)
+            out2, rc2 = run_stage("cover",  timeout=600)
+        stages_run.append(("tailor", rc, out[-2000:]))
+        stages_run.append(("cover",  rc2, out2[-2000:]))
+
+    # Summary
+    all_ok = all(rc == 0 for _, rc, _ in stages_run)
+    for stage, rc, output in stages_run:
+        if rc == 0:
+            st.success(f"✅ `{stage}` OK")
+        else:
+            st.error(f"❌ `{stage}` failed (exit {rc})")
+        with st.expander(f"{stage} output", expanded=False):
+            st.code(output, language="bash")
+
+    if all_ok:
+        # Fetch the resulting job from DB to show what was made
+        c2 = sqlite3.connect(str(DB_PATH), timeout=30)
+        c2.row_factory = sqlite3.Row
+        row = c2.execute("SELECT title, fit_score, tailored_resume_path, cover_letter_path FROM jobs WHERE url=?", (url,)).fetchone()
+        c2.close()
+        if row:
+            st.subheader("Result")
+            st.write(f"**Title:** {row['title']}")
+            st.write(f"**Fit score:** {row['fit_score']}/10")
+            if row['tailored_resume_path']:
+                st.write(f"**Tailored resume:** `{row['tailored_resume_path']}`")
+            if row['cover_letter_path']:
+                st.write(f"**Cover letter:** `{row['cover_letter_path']}`")
+        st.balloons()
+    else:
+        st.warning("Some stages failed — check output above.")
+
 def page_settings():
     st.title("⚙️ Settings")
 
@@ -800,7 +933,7 @@ EDITOR=nano crontab -e
     st.subheader("📲 Telegram Notifications")
     st.caption("Set these env vars or add them to ~/.applypilot/.env")
     st.code("""# In ~/.applypilot/.env
-TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_BOT_TOKEN=***
 TELEGRAM_CHAT_ID=your_chat_id
 
 # To get a bot token: message @BotFather on Telegram
@@ -808,7 +941,127 @@ TELEGRAM_CHAT_ID=your_chat_id
 """)
     st.info("Telegram alerts are sent automatically when a job is queued for approval and when an application is submitted.")
 
-# ── Route ────────────────────────────────────────────────────────────────────
+    st.divider()
+
+    # ── Database management ──────────────────────────────────────────────────
+    st.subheader("🗄️ Database Management")
+    st.caption("Clean up old jobs. Operations are permanent — use with care.")
+
+    # Show current DB stats
+    try:
+        import sqlite3 as _sql
+        c = _sql.connect(str(DB_PATH), timeout=10)
+        total      = c.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        scored     = c.execute("SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL").fetchone()[0]
+        tailored   = c.execute("SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL").fetchone()[0]
+        applied    = c.execute("SELECT COUNT(*) FROM jobs WHERE apply_status = 'applied'").fetchone()[0]
+        c.close()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total",     total)
+        c2.metric("Scored",    scored)
+        c3.metric("Tailored",  tailored)
+        c4.metric("Applied",   applied)
+    except Exception as e:
+        st.error(f"DB read error: {e}")
+
+    st.write("")
+
+    # Delete all
+    st.markdown("##### 🗑️ Delete all jobs")
+    with st.form("delete_all_form", clear_on_submit=False):
+        st.warning("⚠️ This will delete **every** job in the database. Cannot be undone.")
+        confirm_all = st.text_input('Type **DELETE ALL** to confirm', key="confirm_all")
+        delete_all_btn = st.form_submit_button("🗑️ Delete all jobs", type="secondary")
+    if delete_all_btn:
+        if confirm_all.strip() != "DELETE ALL":
+            st.error("Confirmation text doesn't match. No rows deleted.")
+        else:
+            try:
+                c = sqlite3.connect(str(DB_PATH), timeout=30)
+                cur = c.cursor()
+                cur.execute("SELECT COUNT(*) FROM jobs")
+                before = cur.fetchone()[0]
+                cur.execute("DELETE FROM jobs")
+                deleted = cur.rowcount
+                c.commit()
+                c.close()
+                st.success(f"✅ Deleted {deleted} of {before} jobs.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Delete failed: {e}")
+
+    st.write("")
+
+    # Delete older than
+    st.markdown("##### 📅 Delete jobs older than a date")
+    with st.form("delete_older_form", clear_on_submit=False):
+        cutoff_date = st.date_input("Delete jobs discovered before this date", value=None)
+        # Also offer status filter
+        only_unscored = st.checkbox("Only delete jobs that have NOT been scored", value=False)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            dry_run = st.form_submit_button("🔍 Preview (count only)")
+        with col_b:
+            really_delete = st.form_submit_button("🗑️ Delete", type="secondary")
+
+    if cutoff_date and (dry_run or really_delete):
+        try:
+            cutoff_iso = f"{cutoff_date.isoformat()}T00:00:00"
+            c = sqlite3.connect(str(DB_PATH), timeout=30)
+            cur = c.cursor()
+            if only_unscored:
+                count_q = "SELECT COUNT(*) FROM jobs WHERE discovered_at < ? AND fit_score IS NULL"
+                del_q   = "DELETE FROM jobs WHERE discovered_at < ? AND fit_score IS NULL"
+            else:
+                count_q = "SELECT COUNT(*) FROM jobs WHERE discovered_at < ?"
+                del_q   = "DELETE FROM jobs WHERE discovered_at < ?"
+            n = cur.execute(count_q, (cutoff_iso,)).fetchone()[0]
+            if dry_run:
+                st.info(f"Would delete **{n}** jobs discovered before {cutoff_date}"
+                        + (" (unscored only)" if only_unscored else ""))
+            else:
+                if n == 0:
+                    st.info("No jobs matched — nothing deleted.")
+                else:
+                    # Require a second confirmation
+                    confirm = st.text_input(
+                        f'Type **{n}** to confirm deletion of {n} jobs',
+                        key=f"confirm_older_{n}"
+                    )
+                    if confirm.strip() == str(n):
+                        cur.execute(del_q, (cutoff_iso,))
+                        c.commit()
+                        st.success(f"✅ Deleted {cur.rowcount} jobs.")
+                        st.rerun()
+                    else:
+                        st.warning(f"Type the number {n} to confirm.")
+            c.close()
+        except Exception as e:
+            st.error(f"Operation failed: {e}")
+
+    st.write("")
+
+    # Reset failed-applies
+    st.markdown("##### 🔄 Reset failed applications")
+    st.caption("Clear `apply_status='failed'` so they can be retried.")
+    if st.button("🔄 Reset all failed jobs", key="reset_failed"):
+        try:
+            c = sqlite3.connect(str(DB_PATH), timeout=30)
+            cur = c.cursor()
+            cur.execute("""
+                UPDATE jobs SET apply_status=NULL, apply_error=NULL,
+                               apply_attempts=0
+                WHERE apply_status='failed'
+            """)
+            n = cur.rowcount
+            c.commit()
+            c.close()
+            st.success(f"✅ Reset {n} failed jobs.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Reset failed: {e}")
+
+
 if selection == "Dashboard":
     page_dashboard()
 elif selection == "Jobs":

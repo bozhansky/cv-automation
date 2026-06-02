@@ -12,8 +12,9 @@ This document explains how to use the ApplyPilot system to automate job discover
 4. [Running the Pipeline](#4-running-the-pipeline)
 5. [Web UI (Streamlit)](#5-web-ui-streamlit)
 6. [Auto-Apply Agent](#6-auto-apply-agent)
-7. [Troubleshooting](#7-troubleshooting)
-8. [Finding AI Prompting Jobs — Strategy Guide](#8-finding-ai-prompting-jobs--strategy-guide)
+7. [Maintenance: Purge, Cron, DB Indexes](#7-maintenance-purge-cron-db-indexes)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Finding AI Prompting Jobs — Strategy Guide](#9-finding-ai-prompting-jobs--strategy-guide)
 
 ---
 
@@ -218,8 +219,24 @@ LLM_API_KEY=***                     # Any string (Ollama doesn't need real keys)
 - `gemma4:31b-cloud` — recommended, 31B params via Ollama Cloud
 - `deepseek-v4-flash:cloud` — fast, good for structured tasks
 - `qwen3.5:cloud` — strong reasoning
-- `kimi-k2.6:cloud`
+- `kimi-k2.6:cloud` — used by the auto-apply agent (best tool-calling)
 - `minimax-m2.7:cloud`
+
+### AI-Signal Sanitizer (auto-cleanup of LLM output)
+
+Every LLM response in ApplyPilot passes through a post-processor (`applypilot/text_sanitizer.py`) that removes the writing patterns that mark text as AI-generated. It is wired into the LLM client at both return points (OpenAI-compat + native Gemini), so **all 4 LLM call sites benefit automatically**: scorer, tailor (×2), cover_letter.
+
+What it strips:
+- Curly quotes (`""''`) → straight quotes (`"`)
+- Em-dash (`—`) and en-dash (`–`) → hyphen (`-`)
+- AI clichés: "delve", "glimpse", "stark", "In today's world", "Needless to say", "It's not just X, it's also Y", "leverage", "seamless", "robust", and ~100 others
+- Idea repetition (consecutive duplicate sentences dropped)
+- Keyword stuffing (multiple `, , ,`, `!!!`, `?!?!`, etc.)
+- Bias injection: when text reads too neutral, a deterministic humanizing closing sentence is appended (cover letters only — resumes are unaffected because they parse JSON)
+
+Toggles (env vars):
+- `APPLY_NO_SANITIZE=1` — bypass all cleaning (debug only)
+- `APPLY_NO_BIAS=1` — skip the humanizing-tail injection (cover-letter only)
 
 ---
 
@@ -274,7 +291,8 @@ python3 -m applypilot run all
 | `--dry-run` | Preview what would run without executing |
 | `--min-score N` | Override minimum fit score for tailor/cover stages (default: 7) |
 | `-w N` | Parallel workers for discovery/enrichment stages (default: 1) |
-| `--stream` | Run stages concurrently (faster but less verbose) |
+| `--stream / --no-stream` | Run stages concurrently (default: enabled, ~3-4x faster) |
+| `--since {24h\|7d\|ISO}` | Only process jobs discovered at/after this window (e.g. `24h`, `7d`, `2026-06-01T20:00:00`) |
 | `--url TEXT` | Apply to a specific job URL |
 | `--limit N` | Limit number of jobs to process |
 | `--headless` | Run browser in headless mode (auto-apply only) |
@@ -286,6 +304,62 @@ export HOME=/home/bostjan
 python3 -m applypilot status       # show DB counts
 python3 -m applypilot dashboard   # open web dashboard (Streamlit)
 ```
+
+### On-Demand Single-Job Commands
+
+For re-running individual stages on a single job without redoing the whole pipeline:
+
+```bash
+export HOME=/home/bostjan LLM_URL="http://127.0.0.1:11434/v1" \
+       LLM_MODEL="gemma4:31b-cloud" LLM_API_KEY="not-needed"
+
+# Re-tailor a single job by URL (bypasses score threshold)
+python3 -m applypilot tailor "https://www.linkedin.com/jobs/view/4417252427"
+
+# Re-generate cover letter for a single job
+python3 -m applypilot cover  "https://www.linkedin.com/jobs/view/4417252427"
+
+# Or pipeline a new URL not yet in the DB: discover -> score -> tailor -> cover
+# (use the Streamlit Pipeline page for the GUI; CLI: `python3 -m applypilot run all --since 24h`)
+```
+
+### Purge Old Jobs
+
+By default ApplyPilot runs a weekly cleanup that removes jobs discovered more than 7 days ago (and their tailored resume / cover letter files). Two preservation flags:
+
+```bash
+export HOME=/home/bostjan
+
+# Dry-run preview
+python3 -m applypilot purge --dry-run
+
+# Real run (preserves applied + approved jobs)
+python3 -m applypilot purge
+
+# Custom threshold
+python3 -m applypilot purge --older-than-days 14
+
+# Also delete applied/approved jobs (destructive — only when archiving)
+python3 -m applypilot purge --include-applied --include-approved
+```
+
+A row is preserved from purge if **any** of these are set:
+- `applied_at IS NOT NULL` (you already submitted)
+- `approved_at IS NOT NULL` (you explicitly approved it in the Streamlit UI)
+
+### Cron Jobs (Automated)
+
+Three cron jobs are configured to keep the pipeline running unattended:
+
+| Schedule | What | Wrapper |
+|---|---|---|
+| `0 */4 * * *` (every 4h) | `discover` only, with flock lockfile | `~/.hermes/scripts/applypilot_discover.sh` |
+| `0 20 * * *` (20:00 daily) | Full pipeline, last 24h window | `~/.hermes/scripts/applypilot_daily_pipeline.sh` |
+| `0 3 * * 6` (Sat 03:00) | Weekly purge of jobs >7 days old | `~/.hermes/scripts/applypilot_weekly_purge.sh` |
+
+All three log to `~/.applypilot/cron-*.log` and deliver a status summary to the chat.
+
+To inspect or pause: use the `cronjob` tool, or `crontab -l` (the system crontab is empty — Hermes manages these).
 
 ---
 
@@ -307,8 +381,15 @@ Or use the provided launcher:
 - **Dashboard** — pipeline stats, pending approvals, recent jobs
 - **Jobs** — filterable job bank with score/status badges
 - **Job Detail** — per-job view with description, scoring, tailored resume, cover letter, and apply controls
-- **Pipeline** — run any stage manually with live output
+- **Pipeline** — run any stage manually with live output. Also has three sub-sections:
+  - **🚀 Run Whole Pipeline** — one-click `run all` with min-score, `--since` window, and confirm checkbox
+  - **🎯 On-Demand: Tailor / Cover a Single Job** — paste a URL and trigger tailor/cover for one job
+  - **🗑️ Purge Old Jobs** — UI for the weekly purge with days/applied/approved controls
 - **Settings** — edit profile.json, searches.yaml, auto-search interval, Telegram config
+
+### Dashboard approval & preservation
+
+When a job has a tailored resume + cover letter, it appears in the Dashboard's **Pending Approvals** section. Clicking **Approve** sets `apply_status='approved'` and `approved_at=NOW`, which excludes the row from weekly purge. Clicking **Decline** sets `apply_status='declined'` (the row will be eligible for purge).
 
 ---
 
@@ -338,7 +419,56 @@ The auto-apply agent (`agents/auto_apply.py`) uses Playwright automation powered
 
 ---
 
-## 7. Troubleshooting
+## 7. Maintenance: Purge, Cron, DB Indexes
+
+### Database indexes
+
+Three indexes are auto-created on `init_db()`:
+- `idx_jobs_discovered_at` — speeds up `--since` filters and the weekly purge
+- `idx_jobs_apply_status` — speeds up "ready to apply" / "approved" set queries
+- `idx_jobs_fit_score` — speeds up the "high-score jobs" view
+
+You don't need to do anything. If you ever see a fresh DB without them, run:
+
+```bash
+export HOME=/home/bostjan && python3 -c "from applypilot.database import ensure_indexes; print(ensure_indexes())"
+```
+
+### Schema migrations
+
+The jobs table has 26 columns. When new ones are added (e.g. `approved_at`), `ensure_columns()` runs on every `init_db()` and uses `ALTER TABLE ADD COLUMN` to bring old DBs forward. **No data is ever destroyed by a migration.**
+
+### URL canonicalization (dedup)
+
+`store_jobs()` runs every URL through `_canonicalize_url()` before insert. Tracking query params are stripped: `utm_*`, `trk`, `ref`, `vjk`, `fromage`, `gclid`, `fbclid`, `_ga`, `_gl`, `mc_cid`, `mc_eid`, etc. Essential params (Indeed `jk`, LinkedIn `currentJobId`) are kept. This collapses LinkedIn `?trk=...` and Indeed `?vjk=...` variants of the same job into a single row.
+
+### Watchdog (orphan-process prevention)
+
+The 4-hourly discover cron uses `flock -n` on `/tmp/applypilot_discover.lock` to prevent stacking. If a previous discover is still running, the new tick exits immediately (logs "Another discover is already running — skipping"). The lock auto-releases when the process exits (no stale lockfiles).
+
+### Manual intervention
+
+```bash
+# Force re-score all jobs (clears fit_score)
+sqlite3 /home/bostjan/.applypilot/applypilot.db \
+  "UPDATE jobs SET fit_score=NULL, score_reasoning=NULL, scored_at=NULL"
+
+# Count jobs by apply_status
+sqlite3 /home/bostjan/.applypilot/applypilot.db \
+  "SELECT apply_status, COUNT(*) FROM jobs WHERE apply_status IS NOT NULL GROUP BY apply_status"
+
+# Tailored-but-not-yet-applied (the "ready to apply" queue)
+sqlite3 /home/bostjan/.applypilot/applypilot.db \
+  "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
+
+# Approved-but-not-yet-applied
+sqlite3 /home/bostjan/.applypilot/applypilot.db \
+  "SELECT COUNT(*) FROM jobs WHERE approved_at IS NOT NULL AND applied_at IS NULL"
+```
+
+---
+
+## 8. Troubleshooting
 
 ### "No module named 'jobspy'"
 
@@ -407,7 +537,7 @@ Check that the working directory is the project root when running `streamlit run
 
 ---
 
-## 8. Finding AI Prompting Jobs — Strategy Guide
+## 9. Finding AI Prompting Jobs — Strategy Guide
 
 Your profile has a strong combination of **business analysis + AI/ML skills**. Here's how to position yourself and get the most from ApplyPilot.
 
