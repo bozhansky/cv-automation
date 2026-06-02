@@ -116,6 +116,30 @@ def mark_pending_approval(conn: sqlite3.Connection, url: str) -> None:
     conn.commit()
 
 
+def mark_approval_approved(conn: sqlite3.Connection, url: str,
+                            actor: str = "dashboard") -> None:
+    """Mark a job as approved for application (sets approved_at + status).
+
+    Called from:
+      - Dashboard "Approve" button (actor='dashboard')
+      - Telegram callback button (actor='telegram:<username>')
+
+    Args:
+        conn: SQLite connection
+        url: Job URL
+        actor: Where the approval came from (for audit logging)
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("""
+        UPDATE jobs SET
+            apply_status = 'approved',
+            approved_at = ?
+        WHERE url = ?
+    """, (now, url))
+    conn.commit()
+    logger.info("Job approved by %s: %s", actor, url[:80])
+
+
 def mark_applied(conn: sqlite3.Connection, url: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("""

@@ -536,9 +536,28 @@ def page_dashboard():
                 c1.write(score_badge(job.get("fit_score")))
                 c2.markdown(f"**{job.get('title', '?')}**\n{job.get('site', '')} · {job.get('location', '')}")
                 uk = hashlib.sha1((job.get("url") or "").encode()).hexdigest()[:8]
-                if c3.button("Approve", key=f"pend_approve_{uk}"):
-                    st.session_state["_pending_approve"] = job.get("url")
-                    st.rerun()
+                # Approve flow: click button → confirm dialog → call mark_approval_approved
+                approve_key = f"pend_appr_state_{uk}"
+                if approve_key not in st.session_state:
+                    st.session_state[approve_key] = "idle"
+                aks = st.session_state[approve_key]
+                if aks == "idle":
+                    if c3.button("Approve", key=f"pend_approve_{uk}"):
+                        st.session_state[approve_key] = "confirming"
+                        st.rerun()
+                elif aks == "confirming":
+                    c3.markdown("**Confirm?**")
+                    cba, cbb = c3.columns(2)
+                    if cba.button("✓ Yes", key=f"pend_yes_{uk}", type="primary"):
+                        from agents.auto_apply import mark_approval_approved
+                        conn2 = get_conn()
+                        mark_approval_approved(conn2, job.get("url"), actor="dashboard")
+                        st.session_state[approve_key] = "idle"
+                        st.success("Approved ✅")
+                        st.rerun()
+                    if cbb.button("✗ No", key=f"pend_no_{uk}"):
+                        st.session_state[approve_key] = "idle"
+                        st.rerun()
                 if c3.button("Decline", key=f"pend_decline_{uk}"):
                     from agents.auto_apply import mark_approval_declined
                     conn2 = get_conn()

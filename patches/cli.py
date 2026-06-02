@@ -708,6 +708,177 @@ def doctor() -> None:
 
 
 # -------------------------------------------------------------------
+# telegram-listener: start/stop/status for the Telegram callback daemon
+# -------------------------------------------------------------------
+@app.command()
+def telegram_listener(
+    action: str = typer.Argument(..., help="start | stop | status | restart"),
+) -> None:
+    """Manage the Telegram callback polling daemon (4.6 inline-keyboard approval flow).
+
+    The daemon listens for button taps on Telegram messages sent by
+    `notify_approval_needed()`. When you tap ✅ Approve or ❌ Decline on a
+    Telegram notification, this daemon catches the callback_query, calls
+    `mark_approval_approved()` or `mark_approval_declined()` in the DB,
+    and edits the original message to show the result.
+
+    Examples:
+        python3 -m applypilot telegram-listener start
+        python3 -m applypilot telegram-listener status
+        python3 -m applypilot telegram-listener stop
+        python3 -m applypilot telegram-listener restart
+    """
+    import os
+    import signal
+    import subprocess
+    from pathlib import Path as _P
+
+    pid_path = _P(os.environ.get(
+        "APPLY_TELEGRAM_LISTENER_PID",
+        "/tmp/applypilot_telegram_listener.pid",
+    ))
+    # Locate the daemon script: the applypilot package ships its own copy at
+    # <pkg>/scripts/telegram_callback_daemon.py, OR the user's local copy at
+    # <cwd>/scripts/telegram_callback_daemon.py. Prefer the local one.
+    here = _P(__file__).parent
+    candidates = [
+        _P.cwd() / "scripts" / "telegram_callback_daemon.py",
+        here / "scripts" / "telegram_callback_daemon.py",
+    ]
+    daemon_script = next((c for c in candidates if c.exists()), None)
+    if daemon_script is None and action in ("start", "restart"):
+        typer.echo("❌ Could not find telegram_callback_daemon.py. Looked in:")
+        for c in candidates:
+            typer.echo(f"   • {c}")
+        raise typer.Exit(code=2)
+
+    def _is_running() -> int | None:
+        """Return the daemon's PID if running, else None."""
+        if not pid_path.exists():
+            return None
+        try:
+            pid = int(pid_path.read_text().strip())
+        except (ValueError, OSError):
+            return None
+        # Check if the process is alive
+        try:
+            os.kill(pid, 0)
+        except (OSError, ProcessLookupError):
+            return None
+        return pid
+
+    def _start() -> None:
+        existing = _is_running()
+        if existing is not None:
+            typer.echo(f"ℹ️  Daemon already running (pid={existing})")
+            return
+        typer.echo(f"Starting Telegram callback daemon: {daemon_script}")
+        log_path = _P(os.environ.get(
+            "APPLY_TELEGRAM_LISTENER_LOG",
+            "/tmp/applypilot_telegram_listener.log",
+        ))
+        # Launch via setsid so the daemon survives our shell exit
+        try:
+            log_fd = open(log_path, "a")
+        except OSError as e:
+            typer.echo(f"❌ Cannot open log file {log_path}: {e}")
+            raise typer.Exit(code=3)
+        proc = subprocess.Popen(
+            [sys.executable, str(daemon_script)],
+            stdout=log_fd,
+            stderr=log_fd,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # detach from parent process group
+        )
+        # Give the daemon a moment to write its PID file
+        for _ in range(20):
+            time.sleep(0.1)
+            if pid_path.exists():
+                break
+        pid = _is_running()
+        if pid is None:
+            typer.echo(f"❌ Daemon failed to start. Last 20 log lines:")
+            try:
+                lines = log_path.read_text().splitlines()[-20:]
+                for line in lines:
+                    typer.echo(f"   {line}")
+            except OSError:
+                pass
+            raise typer.Exit(code=4)
+        typer.echo(f"✅ Started Telegram callback daemon (pid={pid})")
+        typer.echo(f"   Log: {log_path}")
+        typer.echo(f"   Stop with: python3 -m applypilot telegram-listener stop")
+
+    def _stop() -> None:
+        pid = _is_running()
+        if pid is None:
+            typer.echo("ℹ️  Daemon not running (no PID file or process is dead)")
+            # Cleanup stale pid file
+            try:
+                pid_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        typer.echo(f"Stopping Telegram callback daemon (pid={pid})...")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as e:
+            typer.echo(f"❌ Failed to send SIGTERM: {e}")
+            raise typer.Exit(code=5)
+        # Wait up to 3s for graceful shutdown
+        for _ in range(30):
+            time.sleep(0.1)
+            if _is_running() is None:
+                break
+        else:
+            # Force kill
+            typer.echo("Daemon did not stop gracefully; sending SIGKILL")
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        typer.echo("✅ Stopped.")
+
+    def _status() -> None:
+        pid = _is_running()
+        if pid is None:
+            typer.echo("⏹  Telegram callback daemon is NOT running")
+            typer.echo(f"   (PID file: {pid_path})")
+            return
+        typer.echo(f"✅ Telegram callback daemon is running (pid={pid})")
+        log_path = _P(os.environ.get(
+            "APPLY_TELEGRAM_LISTENER_LOG",
+            "/tmp/applypilot_telegram_listener.log",
+        ))
+        if log_path.exists():
+            typer.echo(f"   Recent log lines:")
+            try:
+                lines = log_path.read_text().splitlines()[-5:]
+                for line in lines:
+                    typer.echo(f"     {line[:120]}")
+            except OSError:
+                pass
+
+    if action == "start":
+        _start()
+    elif action == "stop":
+        _stop()
+    elif action == "status":
+        _status()
+    elif action == "restart":
+        _stop()
+        time.sleep(0.5)
+        _start()
+    else:
+        typer.echo(f"❌ Unknown action: {action!r}. Use start/stop/status/restart.")
+        raise typer.Exit(code=1)
+
+
+# -------------------------------------------------------------------
 # sites: per-site success-rate analytics + dynamic blacklist (4.9, 4.10)
 # -------------------------------------------------------------------
 @app.command()

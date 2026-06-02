@@ -452,9 +452,10 @@ The auto-apply agent (`agents/auto_apply.py`) uses Playwright automation powered
 - Result logged to `applypilot.db` with `applied_at` timestamp
 
 **Telegram integration:**
-- Bot: `@bozhoapplybot` (token configured in `~/.applypilot/.env`)
-- Chat ID: `7003890359`
-- Notifications sent on: job queued for approval, application submitted
+- Bot: `@sluzhbot` (token configured in `~/.applypilot/.env` as `TELEGRAM_BOT_TOKEN`)
+- Chat ID: `7003890359` (in same file as `TELEGRAM_CHAT_ID`)
+- Notifications sent on: job queued for approval, application submitted, apply failed
+- **Inline-keyboard approval flow** — see [§ 6.1 Telegram approval flow](#61-telegram-approval-flow) below
 
 **Apply-stage safety rails (4.1–4.10):**
 
@@ -470,6 +471,85 @@ The apply agent is wrapped in several safety layers that fire BEFORE any Submit/
 | **Dynamic blacklist** (4.10) | Auto-skips sites with > 85 % failure rate AND ≥ 3-streak in the last 30 days (configurable) | `APPLY_ENABLE_BLACKLIST=1` to turn on; `APPLY_BLACKLIST_FAILURE_THRESHOLD`, `APPLY_BLACKLIST_STREAK_THRESHOLD`, `APPLY_BLACKLIST_DAYS`, `APPLY_BLACKLIST_MIN_ATTEMPTS` to tune |
 | **MCP fallback** (4.5) | If the local Ollama agent loop is unavailable, falls back to a Playwright MCP server if installed | Built-in detection |
 | **Per-site form schema cache** (4.8) | Once a site's form structure is learned, it's cached and re-used on subsequent applies (saves 2-3 turns of discovery) | Built-in |
+
+### 6.1 Telegram approval flow
+
+When a job reaches the `pending_approval` state, ApplyPilot sends you a Telegram message with an **inline keyboard** containing `[✅ Approve]` and `[❌ Decline]` buttons. Tap one and the decision is recorded instantly — no need to open the dashboard.
+
+```
+⏳ Approval needed: Senior AI Engineer
+   🏢 Lumiform
+   🌐 linkedin
+   📊 Fit score: 9/10
+
+Tap a button below to approve or decline.
+
+[✅ Approve]  [❌ Decline]
+```
+
+**How it works:**
+
+1. `applypilot.apply.notifier.notify_approval_needed(job)` is called when a job enters `pending_approval`
+2. The notifier sends a Telegram message with `reply_markup.inline_keyboard` containing the two buttons
+3. **You tap** ✅ or ❌ in Telegram
+4. The polling daemon (`scripts/telegram_callback_daemon.py`) catches the `callback_query` event
+5. It calls `mark_approval_approved()` (sets `apply_status='approved'` + `approved_at=now`) or `mark_approval_declined()` in the DB
+6. It sends `answerCallbackQuery` to clear the "loading" spinner
+7. It edits the original message to show the result (e.g. `✅ Approved by @yourusername`)
+
+**Architecture:**
+
+```
+┌─────────────────────┐
+│ applypilot pipeline │
+│ (notifier.py)       │  ── sendMessage with inline_keyboard ──>  Telegram
+└─────────────────────┘
+                                                            ▲
+                                                            │ callback_query
+┌─────────────────────┐                                     │
+│ scripts/            │  ──── getUpdates (long-poll) ────────┘
+│ telegram_callback_  │  ──── mark_approval_approved ────>  DB
+│ daemon.py           │  ──── answerCallbackQuery ───────>  Telegram
+│ (background)        │  ──── editMessageText ────────────>  Telegram
+└─────────────────────┘
+```
+
+**Manage the daemon:**
+
+```bash
+# Start (in background, detached from shell)
+python3 -m applypilot telegram-listener start
+
+# Check if it's running
+python3 -m applypilot telegram-listener status
+
+# Stop it
+python3 -m applypilot telegram-listener stop
+
+# Restart (e.g. after editing the script)
+python3 -m applypilot telegram-listener restart
+```
+
+The daemon writes its PID to `/tmp/applypilot_telegram_listener.pid` and logs to `/tmp/applypilot_telegram_listener.log`. Env var overrides:
+- `APPLY_TELEGRAM_POLL_INTERVAL` (default `1.5` seconds)
+- `APPLY_TELEGRAM_LONG_POLL` (default `1` = enabled; long-polling reduces API calls)
+- `APPLY_TELEGRAM_LONG_POLL_TIMEOUT` (default `25` seconds)
+- `APPLY_TELEGRAM_LISTENER_LOG` (default `/tmp/applypilot_telegram_listener.log`)
+- `APPLY_TELEGRAM_LISTENER_PID` (default `/tmp/applypilot_telegram_listener.pid`)
+- `APPLY_TELEGRAM_EDIT_AFTER_CALLBACK` (default `1` = edit message after decision)
+
+**Run as a cron** (so the daemon survives reboots and is always listening):
+
+```bash
+# Add to ~/.hermes/scripts/ or your existing cron runner
+python3 -m applypilot telegram-listener restart
+```
+
+**How URLs are encoded in buttons:** Telegram buttons can carry at most **64 bytes** of `callback_data`. The notifier handles long URLs by SHA-256-hashing them and storing the mapping in `~/.applypilot/telegram_hash_registry.json`. The daemon reads this registry to resolve hash back to URL.
+
+**Security:** The daemon only processes `callback_query` events from your own `chat_id` (from env). Other users tapping the buttons are ignored with an "Unauthorized chat" answer.
+
+**Testing without Telegram:** You can still approve/decline from the Streamlit Dashboard — it calls the same `mark_approval_approved()` / `mark_approval_declined()` functions, just with `actor='dashboard'` instead of `actor='telegram'`. The approval is recorded identically; the audit log only differs in the `actor` string.
 
 ---
 
@@ -716,8 +796,8 @@ Your `searches.yaml` uses `country_indeed: "slovenia"` and `location_accept` pat
 ### Auto-Apply Approval Flow
 
 1. Jobs with tailored resume + cover letter appear in Dashboard with **Approve / Decline** buttons
-2. Telegram notification sent to `@bozhoapplybot` when a job is queued
-3. You review in Streamlit and click **Approve** — browser opens with form pre-filled
+2. Telegram notification sent to `@sluzhbot` (with inline-keyboard buttons) when a job is queued
+3. You either tap the button in Telegram or click **Approve** in the Streamlit Dashboard — browser opens with form pre-filled
 4. You review the pre-fill and submit manually
 5. DB updated → Telegram confirmation sent
 

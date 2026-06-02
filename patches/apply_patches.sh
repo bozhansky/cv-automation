@@ -86,8 +86,9 @@ if [[ "$BACKUP_ONLY" == true ]]; then
     exit 0
 fi
 
-# Copy each .py file
-for src in "$SCRIPT_DIR"/*.py; do
+# Copy each .py file (recursively — includes apply/ and scripts/ subdirs)
+shopt -s nullglob
+while IFS= read -r -d '' src; do
     rel="${src#$SCRIPT_DIR/}"
     echo
     echo "→ $rel"
@@ -108,6 +109,8 @@ for src in "$SCRIPT_DIR"/*.py; do
             echo "    ✓ $dest"
         fi
     done
+done < <(find "$SCRIPT_DIR" -name "*.py" -type f -print0)
+shopt -u nullglob
 done
 
 # Verify sync

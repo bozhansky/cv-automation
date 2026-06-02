@@ -108,8 +108,20 @@ def reset_cache() -> None:
 def _send_telegram_message(token: str, chat_id: str, text: str,
                             parse_mode: str = "HTML",
                             disable_web_preview: bool = True,
+                            reply_markup: dict | None = None,
                             timeout: float = 10.0) -> bool:
-    """Send a message via the Telegram Bot API. Returns True on success."""
+    """Send a message via the Telegram Bot API. Returns True on success.
+
+    Args:
+        token: Bot token
+        chat_id: Numeric chat id
+        text: Message body
+        parse_mode: "HTML" or "MarkdownV2"
+        disable_web_preview: True hides link previews
+        reply_markup: Optional inline-keyboard markup dict, e.g.
+            {"inline_keyboard": [[{"text": "Yes", "callback_data": "approve:..."}]]}
+        timeout: HTTP timeout in seconds
+    """
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -117,6 +129,8 @@ def _send_telegram_message(token: str, chat_id: str, text: str,
         "parse_mode": parse_mode,
         "disable_web_page_preview": disable_web_preview,
     }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -217,3 +231,126 @@ def notify_failed(job: dict, error: str | None = None) -> bool:
 
     threading.Thread(target=_send, daemon=True).start()
     return True
+
+
+# -------------------------------------------------------------------
+# Inline-keyboard approval flow (4.6 extension)
+# -------------------------------------------------------------------
+# Telegram inline-keyboard buttons can carry at most 64 bytes of callback_data.
+# We use the prefix scheme: "approve:<url>" or "decline:<url>". Long URLs are
+# hashed to fit; the listener daemon (scripts/telegram_callback_daemon.py)
+# maintains a hash→url registry so it can resolve them back.
+#
+# When a button is tapped, Telegram sends a callback_query to the bot. Our
+# polling daemon picks it up, calls agents.auto_apply.mark_approval_approved()
+# or mark_approval_declined(), and answers the callback with a brief ack.
+
+import hashlib as _hashlib
+
+# Reserved callback_data prefixes (don't use these in regular messages)
+CALLBACK_APPROVE = "approve:"
+CALLBACK_DECLINE = "decline:"
+
+
+def _url_to_callback_data(prefix: str, url: str) -> str:
+    """Build a callback_data string of at most 64 bytes.
+
+    Strategy: if the URL fits within (64 - len(prefix) - 8) chars, use the
+    raw URL. Otherwise use a SHA-256 prefix (8 hex chars) of the URL.
+    The daemon maintains a hash→url registry file to resolve back.
+    """
+    max_url_bytes = 64 - len(prefix) - 8  # leave room for ':<hash>' fallback
+    if len(url.encode("utf-8")) <= max_url_bytes:
+        return f"{prefix}{url}"
+    h = _hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}h:{h}"
+
+
+def _approval_markup(url: str) -> dict:
+    """Build the inline-keyboard markup for an approval request.
+
+    Returns a dict suitable for the `reply_markup` parameter of sendMessage.
+    """
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": _url_to_callback_data(CALLBACK_APPROVE, url)},
+            {"text": "❌ Decline", "callback_data": _url_to_callback_data(CALLBACK_DECLINE, url)},
+        ]]
+    }
+
+
+def notify_approval_needed(job: dict) -> bool:
+    """Send a Telegram notification asking the user to approve an application.
+
+    Includes an inline keyboard with [✅ Approve] [❌ Decline] buttons. The
+    callback is processed by scripts/telegram_callback_daemon.py, which
+    calls mark_approval_approved() or mark_approval_declined() in the DB.
+
+    Args:
+        job: dict with at least 'url', 'title', 'company', 'site'
+
+    Returns:
+        True if the message was sent, False if not configured or send failed.
+    """
+    token, chat_id = _load_creds()
+    if not token or not chat_id:
+        return False
+
+    url = str(job.get("url") or job.get("application_url") or "")
+    if not url:
+        logger.warning("notify_approval_needed: no URL in job dict, skipping")
+        return False
+
+    title = _html_escape(str(job.get("title") or "(no title)"))
+    company = _html_escape(str(job.get("company") or "(unknown)"))
+    site = _html_escape(str(job.get("site") or "unknown"))
+    score = job.get("fit_score")
+    score_str = f"{score}/10" if score is not None else "?"
+
+    parts = [f"⏳ <b>Approval needed:</b> {title}"]
+    if company and company != "(unknown)":
+        parts.append(f"   🏢 {company}")
+    if site and site != "unknown":
+        parts.append(f"   🌐 {site}")
+    parts.append(f"   📊 Fit score: {score_str}")
+    parts.append("")
+    parts.append("Tap a button below to approve or decline.")
+
+    text = "\n".join(parts)
+    markup = _approval_markup(url)
+
+    def _send() -> None:
+        ok = _send_telegram_message(token, chat_id, text, reply_markup=markup)
+        if not ok:
+            logger.warning("Telegram notify_approval_needed: send failed for %s", url[:80])
+
+    threading.Thread(target=_send, daemon=True).start()
+    return True
+
+
+def answer_callback_query(callback_query_id: str,
+                          text: str = "",
+                          show_alert: bool = False,
+                          timeout: float = 5.0) -> bool:
+    """Acknowledge a callback_query (removes the "loading" spinner on the button).
+
+    Required by the Telegram Bot API after every button tap. The polling
+    daemon calls this immediately after processing the callback.
+    """
+    token, chat_id = _load_creds()
+    if not token:
+        return False
+    url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_query_id, "show_alert": show_alert}
+    if text:
+        payload["text"] = text[:200]
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+            return data.get("ok", False)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+        logger.warning("Telegram answerCallbackQuery failed: %s", e)
+        return False
+
