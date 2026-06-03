@@ -230,6 +230,17 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 def get_conn():
     return sqlite3.connect(str(DB_PATH), timeout=30)
 
+def _count_jobs_above_score(min_score: int) -> int:
+    """Count jobs in the DB with fit_score >= min_score. Used by pipeline UI."""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE fit_score >= ?", (min_score,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
 def row_to_dict(row) -> dict | None:
     if row is None:
         return None
@@ -278,11 +289,20 @@ def read_file_text(path_str: str | None) -> str:
             return ""
     return ""
 
-def run_stage(stage: str, timeout=600) -> tuple[str, int]:
-    """Run applypilot stage. Returns (output, returncode)."""
+def run_stage(stage: str, timeout=600, min_score: int = 0,
+              since: str | None = None, workers: int = 1) -> tuple[str, int]:
+    """Run applypilot stage. Returns (output, returncode).
+
+    Args:
+        stage: Pipeline stage name (or 'cover_sl' for multilingual).
+        timeout: Max seconds to wait.
+        min_score: Minimum fit score for tailor/cover (0 = no filter).
+        since: Optional ISO datetime or relative string ('24h', '7d').
+        workers: Number of parallel workers.
+    """
     env = os.environ.copy()
     env["HOME"] = str(Path.home())
-    
+
     # Handle custom stages
     if stage == "cover_sl":
         # Run Slovenian cover letter generation
@@ -292,10 +312,18 @@ def run_stage(stage: str, timeout=600) -> tuple[str, int]:
             cwd=str(Path.home()), env=env,
         )
         return res.stdout + res.stderr, res.returncode
-    
-    # Standard applypilot stages
+
+    # Build CLI args for the standard applypilot stages
+    args = ["python3", "-m", "applypilot", "run", stage]
+    if min_score and min_score > 0:
+        args += ["--min-score", str(min_score)]
+    if since:
+        args += ["--since", since]
+    if workers and workers > 1:
+        args += ["--workers", str(workers)]
+
     res = subprocess.run(
-        ["python3", "-m", "applypilot", "run", stage],
+        args,
         capture_output=True, text=True, timeout=timeout,
         cwd=str(Path.home()), env=env,
     )
@@ -933,12 +961,65 @@ def page_job_detail():
 def page_pipeline():
     st.title("⚙️ Pipeline")
 
+    # ── Global pipeline controls ─────────────────────────────────────────────
+    # These settings apply to ALL stage buttons in this section, so you can
+    # tune the threshold once and run several stages with the same filter.
+    st.subheader("🎛️ Pipeline controls")
+    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns(3)
+    with col_ctrl1:
+        # Default 0 (no filter) so this matches `applypilot run` default.
+        # Users who want "only score >= 10" can set it to 10.
+        min_score = st.slider(
+            "Min fit score for tailor/cover",
+            min_value=0, max_value=10, value=0, step=1,
+            help=(
+                "0 = no filter (process all scored jobs). "
+                "7 = recommended (default for `applypilot run`). "
+                "10 = only the very best matches. "
+                "Score 1-3 is auto-skipped by the scorer anyway."
+            ),
+        )
+    with col_ctrl2:
+        since = st.selectbox(
+            "Only process jobs discovered in…",
+            options=["(no filter)", "Last 24h", "Last 7d", "Last 30d"],
+            index=0,
+            help=(
+                "Useful for daily cron runs — only process new discoveries, "
+                "don't re-tailor jobs from previous days."
+            ),
+        )
+    with col_ctrl3:
+        workers = st.number_input(
+            "Parallel workers",
+            min_value=1, max_value=8, value=1, step=1,
+            help="Number of parallel threads for discover/enrich stages.",
+        )
+
+    # Translate the human-friendly labels into CLI flag values
+    since_map = {"(no filter)": None, "Last 24h": "24h", "Last 7d": "7d", "Last 30d": "30d"}
+    since_arg = since_map[since]
+    # Stash so individual buttons can read the same values without re-rendering
+    st.session_state["pipeline_min_score"] = min_score
+    st.session_state["pipeline_since"] = since_arg
+    st.session_state["pipeline_workers"] = workers
+
+    # Show what the current selection will do
+    if min_score > 0:
+        st.info(
+            f"📊 Currently filtering to **score ≥ {min_score}**. "
+            f"{_count_jobs_above_score(min_score)} jobs in the DB match.",
+            icon="🎯",
+        )
+
+    st.divider()
+
     stages = [
         ("discover",  "Discover Jobs",       "Search job boards (LinkedIn, Indeed, Glassdoor, ZipRecruiter)"),
         ("employers","Discover Employers",   "Scrape career pages from 18 target companies"),
         ("enrich",    "Enrich Details",       "Fetch full job descriptions"),
         ("score",     "Score Jobs",           "Rate jobs 1-10 using resume + Ollama"),
-        ("tailor",    "Tailor Resume",        "Rewrite resume bullets for score ≥ 7 jobs"),
+        ("tailor",    "Tailor Resume",        f"Rewrite resume bullets for score ≥ {min_score if min_score else 7} jobs"),
         ("cover",     "Write Cover Letter",   "Generate personalised cover letters (English)"),
         ("cover_sl",  "Write Cover Letter (SL)", "Generate Slovenian cover letters for mojedelo jobs"),
         ("pdf",       "Export PDF",           "Convert to PDF"),
@@ -954,7 +1035,12 @@ def page_pipeline():
             with col_btn:
                 if st.button(f"▶ Run {label}", key=f"run_{stage}"):
                     with st.spinner(f"Running `{stage}`..."):
-                        output, rc = run_stage(stage)
+                        output, rc = run_stage(
+                            stage,
+                            min_score=min_score,
+                            since=since_arg,
+                            workers=workers,
+                        )
                     last_out[0] = output[-4000:]
                     last_rc[0]  = rc
                     st.rerun()

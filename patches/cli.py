@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -783,12 +786,48 @@ def telegram_listener(
         except OSError as e:
             typer.echo(f"❌ Cannot open log file {log_path}: {e}")
             raise typer.Exit(code=3)
+        # Build a clean env for the daemon. Inherit everything from the parent
+        # but make sure the Telegram token/chat_id are loaded from .env if the
+        # parent shell didn't set them. (A plain `python3 -m applypilot
+        # telegram-listener start` from a fresh shell has no Telegram creds.)
+        child_env = os.environ.copy()
+        # Load ~/.applypilot/.env ourselves (Python doesn't auto-load .env).
+        for env_path in (
+            _P.home() / ".applypilot" / ".env",
+            _P.cwd() / ".env",
+        ):
+            if env_path.exists():
+                try:
+                    for line in env_path.read_text().splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, _, v = line.partition("=")
+                        k, v = k.strip(), v.strip().strip('"').strip("'")
+                        if k and v and k not in child_env:
+                            child_env[k] = v
+                except Exception as e:
+                    logging.debug("Could not load %s: %s", env_path, e)
+                break
+        # Also try the notifier's secrets file path
+        try:
+            import applypilot.apply.notifier as _n
+            import importlib
+            importlib.reload(_n)
+            tok, cid = _n._load_creds()
+            if tok and "TELEGRAM_BOT_TOKEN" not in child_env and "APPLY_TELEGRAM_BOT_TOKEN" not in child_env:
+                child_env["TELEGRAM_BOT_TOKEN"] = tok
+            if cid and "TELEGRAM_CHAT_ID" not in child_env and "APPLY_TELEGRAM_CHAT_ID" not in child_env:
+                child_env["TELEGRAM_CHAT_ID"] = cid
+        except Exception as e:
+            logging.debug("Could not preload Telegram creds: %s", e)
         proc = subprocess.Popen(
             [sys.executable, str(daemon_script)],
             stdout=log_fd,
             stderr=log_fd,
             stdin=subprocess.DEVNULL,
             start_new_session=True,  # detach from parent process group
+            env=child_env,
         )
         # Give the daemon a moment to write its PID file
         for _ in range(20):

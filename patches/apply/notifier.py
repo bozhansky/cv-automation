@@ -42,7 +42,24 @@ _CACHED_CHAT_ID: str | None = None
 _CACHE_LOADED = False
 
 # Default location: Hermes secrets (sibling of gmb_bklajnscak_token.json)
-_SECRETS_PATH = Path.home() / ".hermes" / "secrets" / "telegram.json"
+# We try several locations because the bot can run in different contexts
+# (Hermes profile isolation sets $HOME to a fake home dir).
+_SECRETS_CANDIDATES = [
+    Path.home() / ".hermes" / "secrets" / "telegram.json",
+    Path("/home/bostjan") / ".hermes" / "secrets" / "telegram.json",
+    Path("/home/bostjan") / ".applypilot" / "telegram.json",
+    Path("/home/bostjan") / ".applypilot" / ".telegram.json",
+]
+# Keep backwards-compatible name pointing at the first candidate
+_SECRETS_PATH = _SECRETS_CANDIDATES[0]
+
+
+def _find_secrets_file() -> Path | None:
+    """Return the first existing secrets-file path, or None."""
+    for p in _SECRETS_CANDIDATES:
+        if p.exists():
+            return p
+    return None
 
 
 def _first_env(*names: str) -> str | None:
@@ -79,15 +96,41 @@ def _load_creds() -> tuple[str | None, str | None]:
         "TELEGRAM_CHAT_ID",
     )
 
-    # Fallback to secrets file
-    if (not token or not chat_id) and _SECRETS_PATH.exists():
-        try:
-            data = json.loads(_SECRETS_PATH.read_text())
-            token = token or data.get("bot_token")
-            cid = data.get("chat_id")
-            chat_id = chat_id or (str(cid) if cid else None)
-        except Exception as e:
-            logger.warning("Telegram notifier: failed to read %s: %s", _SECRETS_PATH, e)
+    # Fallback 1: secrets file (try several candidate paths)
+    if (not token or not chat_id):
+        sp = _find_secrets_file()
+        if sp is not None:
+            try:
+                data = json.loads(sp.read_text())
+                token = token or data.get("bot_token")
+                cid = data.get("chat_id")
+                chat_id = chat_id or (str(cid) if cid else None)
+            except Exception as e:
+                logger.warning("Telegram notifier: failed to read %s: %s", sp, e)
+
+    # Fallback 2: ~/.applypilot/.env (only if env vars are still missing).
+    # The notifier's caller may have already loaded .env into os.environ, so
+    # we only consult the file directly when both token and chat_id are absent.
+    if not token or not chat_id:
+        for env_path in (
+            Path("/home/bostjan") / ".applypilot" / ".env",
+            Path.home() / ".applypilot" / ".env",
+        ):
+            if env_path.exists():
+                try:
+                    for line in env_path.read_text().splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, _, v = line.partition("=")
+                        k, v = k.strip(), v.strip().strip('"').strip("'")
+                        if k in ("TELEGRAM_BOT_TOKEN", "APPLY_TELEGRAM_BOT_TOKEN") and v and not token:
+                            token = v
+                        elif k in ("TELEGRAM_CHAT_ID", "APPLY_TELEGRAM_CHAT_ID") and v and not chat_id:
+                            chat_id = v
+                except Exception as e:
+                    logger.warning("Telegram notifier: failed to read %s: %s", env_path, e)
+                break
 
     _CACHED_TOKEN = token
     _CACHED_CHAT_ID = chat_id
@@ -248,35 +291,138 @@ def notify_failed(job: dict, error: str | None = None) -> bool:
 import hashlib as _hashlib
 
 # Reserved callback_data prefixes (don't use these in regular messages)
-CALLBACK_APPROVE = "approve:"
-CALLBACK_DECLINE = "decline:"
+# NOTE: these do NOT end with ':' — the prefix-separator colon is added by
+# the formatter. This keeps the format uniform: <prefix>:<url> or
+# <prefix>:h:<hash>. The resolver uses partition(':') which always splits
+# on the first colon, so this format is unambiguous.
+CALLBACK_APPROVE     = "approve"
+CALLBACK_DECLINE     = "decline"
+CALLBACK_VIEW_RESUME = "view_resume"
+CALLBACK_VIEW_COVER  = "view_cover"
+
+# Telegram sendMessage text limit is 4096 chars; we leave headroom.
+TELEGRAM_TEXT_LIMIT = 3800
+
+# Bot-uploaded documents cap at 50 MB but we cap previews lower so a single
+# huge file can't hang the notifier thread on a slow network.
+_MAX_PREVIEW_BYTES = 5 * 1024 * 1024
 
 
 def _url_to_callback_data(prefix: str, url: str) -> str:
     """Build a callback_data string of at most 64 bytes.
 
-    Strategy: if the URL fits within (64 - len(prefix) - 8) chars, use the
-    raw URL. Otherwise use a SHA-256 prefix (8 hex chars) of the URL.
-    The daemon maintains a hash→url registry file to resolve back.
+    Output format (uniform across all action types):
+      - raw:    ``<prefix>:<url>``            (when URL fits in the budget)
+      - hashed: ``<prefix>:h:<12-hex-chars>`` (when URL is too long)
+
+    The colon after the prefix is the only separator. The resolver calls
+    ``partition(':')`` to split prefix from payload — so the hash form
+    is always recognised by checking if the payload starts with ``"h:"``.
+
+    Note: callers must pass a prefix WITHOUT a trailing colon. The constants
+    ``CALLBACK_APPROVE`` etc. already follow this convention.
     """
-    max_url_bytes = 64 - len(prefix) - 8  # leave room for ':<hash>' fallback
+    hash_overhead = 3 + 12  # ':h:' + 12 hex chars
+    max_url_bytes = 64 - len(prefix.encode("utf-8")) - 1 - hash_overhead  # -1 for ':'
     if len(url.encode("utf-8")) <= max_url_bytes:
-        return f"{prefix}{url}"
+        return f"{prefix}:{url}"
     h = _hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
-    return f"{prefix}h:{h}"
+    return f"{prefix}:h:{h}"
 
 
 def _approval_markup(url: str) -> dict:
     """Build the inline-keyboard markup for an approval request.
 
     Returns a dict suitable for the `reply_markup` parameter of sendMessage.
+    The keyboard is 2 rows × 2 buttons:
+      Row 1: [📄 Resume] [✉️ Cover letter]
+      Row 2: [✅ Approve] [❌ Decline]
     """
     return {
-        "inline_keyboard": [[
-            {"text": "✅ Approve", "callback_data": _url_to_callback_data(CALLBACK_APPROVE, url)},
-            {"text": "❌ Decline", "callback_data": _url_to_callback_data(CALLBACK_DECLINE, url)},
-        ]]
+        "inline_keyboard": [
+            [
+                {"text": "📄 Resume",   "callback_data": _url_to_callback_data(CALLBACK_VIEW_RESUME, url)},
+                {"text": "✉️ Cover",    "callback_data": _url_to_callback_data(CALLBACK_VIEW_COVER, url)},
+            ],
+            [
+                {"text": "✅ Approve",  "callback_data": _url_to_callback_data(CALLBACK_APPROVE, url)},
+                {"text": "❌ Decline",  "callback_data": _url_to_callback_data(CALLBACK_DECLINE, url)},
+            ],
+        ]
     }
+
+
+def _read_tailored_file(path: str, kind: str) -> tuple[str | None, str | None]:
+    """Read a tailored file (PDF or text) and return (text, error).
+
+    Files larger than ``_MAX_PREVIEW_BYTES`` (default 5 MB) are rejected so a
+    single corrupt huge PDF can't exhaust memory in the background thread.
+
+    Returns:
+        (text, None) on success — `text` is HTML-escaped and truncated to fit
+                                  Telegram's 4096-char message limit.
+        (None, error) on failure — `error` is a short human-readable reason.
+    """
+    if not path:
+        return None, f"no {kind} on file for this job"
+    p = Path(path)
+    if not p.exists():
+        return None, f"{kind.capitalize()} file missing: {p.name}"
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        return None, f"could not stat {p.name}: {e}"
+    if size > _MAX_PREVIEW_BYTES:
+        return None, (
+            f"{p.name} is {size // 1024} KB — too large to preview "
+            f"(limit is {_MAX_PREVIEW_BYTES // 1024} KB)"
+        )
+    try:
+        if p.suffix.lower() == ".pdf":
+            # Try pypdf first; fall back to a best-effort raw read.
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(str(p))
+                chunks = [(page.extract_text() or "") for page in reader.pages]
+                text = "\n\n".join(chunks).strip()
+            except Exception as e:
+                logger.warning("pypdf failed on %s: %s; falling back to raw read", p, e)
+                text = p.read_text(errors="ignore")
+        else:
+            text = p.read_text(errors="ignore")
+    except Exception as e:
+        return None, f"could not read {p.name}: {e}"
+    if not text.strip():
+        return None, f"{p.name} is empty"
+    return text, None
+
+
+def _truncate_for_telegram(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> str:
+    """Truncate text to fit Telegram's message limit, ending on a whole line."""
+    if len(text) <= limit:
+        return text
+    truncated = text[:limit]
+    # Try to end on the last newline so we don't slice a word in half.
+    last_nl = truncated.rfind("\n")
+    if last_nl > limit * 0.7:
+        truncated = truncated[:last_nl]
+    return truncated + "\n\n…(truncated — full file on disk)"
+
+
+def format_preview_message(kind: str, title: str, body: str) -> str:
+    """Build the HTML message body for a preview delivery.
+
+    Wraps the file contents in a header + footer, truncates to the Telegram
+    limit, and HTML-escapes only the wrapping text (the body is treated as
+    preformatted plain text).
+    """
+    header = f"📄 <b>Resume:</b> {_html_escape(title)}\n" if kind == "resume" \
+             else f"✉️ <b>Cover letter:</b> {_html_escape(title)}\n"
+    header += "<pre>"
+    footer = "</pre>"
+    budget = TELEGRAM_TEXT_LIMIT - len(header) - len(footer) - 4
+    body_truncated = _truncate_for_telegram(body, limit=budget)
+    return header + _html_escape(body_truncated) + footer
 
 
 def notify_approval_needed(job: dict) -> bool:
@@ -314,7 +460,7 @@ def notify_approval_needed(job: dict) -> bool:
         parts.append(f"   🌐 {site}")
     parts.append(f"   📊 Fit score: {score_str}")
     parts.append("")
-    parts.append("Tap a button below to approve or decline.")
+    parts.append("Tap a button to preview, approve or decline.")
 
     text = "\n".join(parts)
     markup = _approval_markup(url)

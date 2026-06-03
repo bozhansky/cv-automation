@@ -297,6 +297,20 @@ python3 -m applypilot run all
 | `--limit N` | Limit number of jobs to process |
 | `--headless` | Run browser in headless mode (auto-apply only) |
 
+### Pipeline controls in the Streamlit dashboard
+
+The **Pipeline** page in the Streamlit dashboard has a top-of-page "🎛️ Pipeline controls" bar with three settings that apply to ALL per-stage buttons in that page:
+
+| Control | What it does | Default |
+|---|---|---|
+| **Min fit score for tailor/cover** (slider, 0–10) | When you click ▶ Run `tailor` or ▶ Run `cover`, only jobs with `fit_score >= N` are processed. Set to 10 to only rewrite resumes for the very best matches. | 0 (no filter) |
+| **Only process jobs discovered in…** (selectbox) | Same as CLI `--since`. Useful for daily cron runs so you don't re-tailor jobs from previous days. Options: `(no filter)`, `Last 24h`, `Last 7d`, `Last 30d`. | `(no filter)` |
+| **Parallel workers** (1–8) | Same as CLI `-w`. Number of parallel threads for `discover` and `enrich` stages. | 1 |
+
+The controls translate to the corresponding CLI flags (`--min-score`, `--since`, `--workers`) and are passed through to `run_stage()` which then shells out to `applypilot run`. So the dashboard is just a UI on top of the CLI — same logic, same validation, same AI-signal sanitizer.
+
+The pipeline controls also show a live counter: e.g. "📊 Currently filtering to **score ≥ 9**. 14 jobs in the DB match." so you can see at a glance how many jobs the threshold will process before you click Run.
+
 ### Checking status
 
 ```bash
@@ -474,7 +488,7 @@ The apply agent is wrapped in several safety layers that fire BEFORE any Submit/
 
 ### 6.1 Telegram approval flow
 
-When a job reaches the `pending_approval` state, ApplyPilot sends you a Telegram message with an **inline keyboard** containing `[✅ Approve]` and `[❌ Decline]` buttons. Tap one and the decision is recorded instantly — no need to open the dashboard.
+When a job reaches the `pending_approval` state, ApplyPilot sends you a Telegram message with a **2-row inline keyboard**:
 
 ```
 ⏳ Approval needed: Senior AI Engineer
@@ -482,20 +496,24 @@ When a job reaches the `pending_approval` state, ApplyPilot sends you a Telegram
    🌐 linkedin
    📊 Fit score: 9/10
 
-Tap a button below to approve or decline.
+Tap a button to preview, approve or decline.
 
-[✅ Approve]  [❌ Decline]
+[📄 Resume]  [✉️ Cover]
+[✅ Approve] [❌ Decline]
 ```
+
+**Row 1** is for previewing the tailored resume and cover letter without leaving Telegram — the bot will reply with the file content (text files are sent inline, PDFs are sent as documents plus a short text summary). **Row 2** is the final decision. Both rows stay tappable, so you can preview-then-approve in any order.
 
 **How it works:**
 
 1. `applypilot.apply.notifier.notify_approval_needed(job)` is called when a job enters `pending_approval`
-2. The notifier sends a Telegram message with `reply_markup.inline_keyboard` containing the two buttons
-3. **You tap** ✅ or ❌ in Telegram
+2. The notifier sends a Telegram message with a 2-row `reply_markup.inline_keyboard` (4 buttons total)
+3. **You tap** any of the 4 buttons in Telegram
 4. The polling daemon (`scripts/telegram_callback_daemon.py`) catches the `callback_query` event
-5. It calls `mark_approval_approved()` (sets `apply_status='approved'` + `approved_at=now`) or `mark_approval_declined()` in the DB
-6. It sends `answerCallbackQuery` to clear the "loading" spinner
-7. It edits the original message to show the result (e.g. `✅ Approved by @yourusername`)
+5. For `view_resume` / `view_cover` callbacks: daemon looks up the file path in the DB, reads the tailored file (with pypdf fallback for PDFs, capped at 5 MB), and sends it back as a new Telegram message
+6. For `approve` / `decline` callbacks: daemon calls `mark_approval_approved()` (idempotent: only transitions from `pending_approval` → `approved`, sets `approved_at=now`) or `mark_approval_declined()` in the DB
+7. Daemon sends `answerCallbackQuery` to clear the "loading" spinner
+8. For approve/decline only: daemon edits the original message to show the result (e.g. `✅ Approved by @yourusername`). For preview callbacks, the original message is left intact so you can keep tapping buttons.
 
 **Architecture:**
 
@@ -546,6 +564,15 @@ python3 -m applypilot telegram-listener restart
 ```
 
 **How URLs are encoded in buttons:** Telegram buttons can carry at most **64 bytes** of `callback_data`. The notifier handles long URLs by SHA-256-hashing them and storing the mapping in `~/.applypilot/telegram_hash_registry.json`. The daemon reads this registry to resolve hash back to URL.
+
+The output format is uniform across all 4 button types:
+
+| Form | Format | When |
+|---|---|---|
+| Raw | `<prefix>:<url>` (e.g. `approve:https://…`) | URL ≤ 64 − len(prefix) − 1 bytes |
+| Hashed | `<prefix>:h:<12-hex>` (e.g. `view_resume:h:9a7ae30340af`) | URL is too long for raw form |
+
+The resolver calls `partition(':')` to split prefix from payload, then checks if the payload starts with `h:`. This format is the same for approve / decline / view_resume / view_cover, so the daemon's switch logic is one-liner.
 
 **Security:** The daemon only processes `callback_query` events from your own `chat_id` (from env). Other users tapping the buttons are ignored with an "Unauthorized chat" answer.
 

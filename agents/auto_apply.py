@@ -117,7 +117,7 @@ def mark_pending_approval(conn: sqlite3.Connection, url: str) -> None:
 
 
 def mark_approval_approved(conn: sqlite3.Connection, url: str,
-                            actor: str = "dashboard") -> None:
+                            actor: str = "dashboard") -> bool:
     """Mark a job as approved for application (sets approved_at + status).
 
     Called from:
@@ -128,16 +128,27 @@ def mark_approval_approved(conn: sqlite3.Connection, url: str,
         conn: SQLite connection
         url: Job URL
         actor: Where the approval came from (for audit logging)
+
+    Returns:
+        True if a row was actually changed, False if the job was already
+        approved/applied/etc. (idempotent guard for re-tap scenarios).
     """
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute("""
+    # Only transition from "pending_approval" → "approved". Other statuses
+    # (already applied, already declined, etc.) are left alone so the audit
+    # trail is preserved. If the user re-taps Approve, we just no-op.
+    cur = conn.execute("""
         UPDATE jobs SET
             apply_status = 'approved',
             approved_at = ?
         WHERE url = ?
+          AND apply_status = 'pending_approval'
     """, (now, url))
     conn.commit()
-    logger.info("Job approved by %s: %s", actor, url[:80])
+    changed = cur.rowcount > 0
+    if changed:
+        logger.info("Job approved by %s: %s", actor, url[:80])
+    return changed
 
 
 def mark_applied(conn: sqlite3.Connection, url: str) -> None:
@@ -151,12 +162,20 @@ def mark_applied(conn: sqlite3.Connection, url: str) -> None:
     conn.commit()
 
 
-def mark_approval_declined(conn: sqlite3.Connection, url: str) -> None:
-    conn.execute("""
+def mark_approval_declined(conn: sqlite3.Connection, url: str,
+                            actor: str = "dashboard") -> bool:
+    """Mark a job as declined. Idempotent — only updates if still pending.
+
+    Returns:
+        True if a row was actually changed.
+    """
+    cur = conn.execute("""
         UPDATE jobs SET apply_status = 'declined'
         WHERE url = ?
+          AND apply_status IN ('pending_approval', 'approved')
     """, (url,))
     conn.commit()
+    return cur.rowcount > 0
 
 
 # ── Telegram notification ─────────────────────────────────────────────────────
