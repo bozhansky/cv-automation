@@ -632,7 +632,13 @@ The jobs table has 26 columns. When new ones are added (e.g. `approved_at`), `en
 
 ### URL canonicalization (dedup)
 
-`store_jobs()` runs every URL through `_canonicalize_url()` before insert. Tracking query params are stripped: `utm_*`, `trk`, `ref`, `vjk`, `fromage`, `gclid`, `fbclid`, `_ga`, `_gl`, `mc_cid`, `mc_eid`, etc. Essential params (Indeed `jk`, LinkedIn `currentJobId`) are kept. This collapses LinkedIn `?trk=...` and Indeed `?vjk=...` variants of the same job into a single row.
+`store_jobs()` has **three layers of deduplication** so the same job never lands twice:
+
+1. **URL canonicalization** — `_canonicalize_url()` strips tracking query params before storage. Stripped: `utm_*`, `trk`, `ref`, `vjk`, `fromage`, `gclid`, `fbclid`, `_ga`, `_gl`, `mc_cid`, `mc_eid`, `msclkid`, `vero_id`, `vero_conv`, `from`, etc. Essential params are kept: Indeed `jk`, LinkedIn `currentJobId`, `q`, `pageNum`. Trailing slashes are normalised. This collapses LinkedIn `?trk=…` and Indeed `?vjk=…` variants of the same job into a single canonical URL.
+2. **In-batch dedup** — `store_jobs()` keeps a `seen_in_batch: set[str]` for the current call. If a single JobSpy crawl returns the same job twice (e.g. overlapping query results), the second one is counted as a duplicate without a DB round-trip.
+3. **DB-level PRIMARY KEY** — `jobs.url` is the SQLite PRIMARY KEY. Even if both layers above are bypassed (e.g. race condition between two parallel discover workers), an `INSERT` on a duplicate URL raises `IntegrityError`, which `store_jobs()` catches and counts as a duplicate.
+
+Verified end-to-end with a synthetic 6-job batch (3 distinct canonical URLs + 3 tracking-param variants): the first insert added 3 rows, the second insert added 0 rows but counted all 6 as duplicates. After the test, 0 exact-URL and 0 canonical-URL duplicates remained in the live DB.
 
 ### Watchdog (orphan-process prevention)
 
@@ -773,6 +779,31 @@ Make sure streamlit is installed:
 pip3 install streamlit --break-system-packages
 ```
 Check that the working directory is the project root when running `streamlit run`.
+
+### Pipeline operates on a phantom database (Hermes $HOME pitfall)
+
+**Symptom:** Operations like `applypilot purge`, `applypilot sites`, or `applypilot status` show 0 jobs even though `~/.applypilot/applypilot.db` has thousands. You may also see `OperationalError: no such column: approved_at` because the phantom DB is missing recent columns.
+
+**Cause:** Under Hermes profile isolation, `$HOME` is set to a sandboxed path like `/home/bostjan/.hermes/profiles/osebno/home/`. `applypilot.config` falls back to `Path.home() / ".applypilot"`, which is a *different* directory from your real `~/.applypilot/`. The CLI creates a brand-new empty DB there on first connect, and silently operates on it from then on.
+
+**Fix (built into applypilot v0.3.0+):** `applypilot/config.py` now uses a `_resolve_app_dir()` helper that scans several candidate paths and picks the first one that contains `applypilot.db`. The same fix is in the Telegram daemon's `_resolve_app_dir()`. So both should resolve to the real `/home/bostjan/.applypilot/` automatically.
+
+**Workaround if you hit it:** set `APPLYPILOT_DIR` (or `APPLY_APPDIR`) to the real path:
+
+```bash
+export APPLYPILOT_DIR=/home/bostjan/.applypilot
+python3 -m applypilot purge --older-than-days 2 --dry-run
+```
+
+**Verify the resolver is working:**
+
+```python
+python3 -c "import applypilot.config; print(applypilot.config.APP_DIR)"
+# Should print: /home/bostjan/.applypilot
+# NOT: /home/bostjan/.hermes/profiles/osebno/home/.applypilot
+```
+
+If it prints the sandboxed path, your DB isn't being found by the resolver — check that the DB file exists and that you have read permission.
 
 ---
 
