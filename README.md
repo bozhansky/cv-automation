@@ -311,6 +311,40 @@ The controls translate to the corresponding CLI flags (`--min-score`, `--since`,
 
 The pipeline controls also show a live counter: e.g. "📊 Currently filtering to **score ≥ 9**. 14 jobs in the DB match." so you can see at a glance how many jobs the threshold will process before you click Run.
 
+### Per-stage timeouts (synchronous runs)
+
+When you click a stage button, the dashboard runs `applypilot run <stage>` synchronously and waits for completion. The default per-stage timeouts in `STAGE_TIMEOUTS` (in `frontend/app.py`) are tuned to typical workload sizes:
+
+| Stage | Default timeout | Why |
+|---|---|---|
+| `discover`  | 10 min | JobSpy crawl, 210 query × location combinations |
+| `employers` | 10 min | Workday portal scrape |
+| `enrich`    | 15 min | Detail page fetches |
+| `score`     | 30 min | ~2 s/job via Ollama |
+| `tailor`    | **2 hours** | ~30–60 s/job via Ollama |
+| `cover`     | **2 hours** | ~20–40 s/job via Ollama |
+| `cover_sl`  | 1 hour | Slovenian multilingual cover |
+| `pdf`       | 10 min | PDF conversion (HTML → weasyprint) |
+
+If the timeout is hit, the dashboard catches `subprocess.TimeoutExpired`, returns rc=124, and prints a clear "WHAT TO DO" message with the exact CLI command to re-run manually or via the systemd service.
+
+### Background mode for heavy stages (`tailor`, `cover`)
+
+For `tailor` and `cover`, the **Run** button shows a "Run in background (systemd)" checkbox. When checked, clicking Run:
+
+1. Spawns the applypilot CLI via `nohup` + `start_new_session=True` (fully detached)
+2. Redirects output to `~/.applypilot/dashboard-{stage}.log`
+3. Returns immediately so you can navigate away
+
+Monitor with:
+
+```bash
+tail -f /home/bostjan/.applypilot/dashboard-tailor.log
+ps -ef | grep applypilot | grep tailor
+```
+
+This is the recommended way to run `tailor --min-score 9 --since 24h` when there are 50+ jobs — synchronously that takes 1–2 hours, but in background it just kicks off and you check on it later.
+
 ### Checking status
 
 ```bash

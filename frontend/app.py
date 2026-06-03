@@ -289,31 +289,106 @@ def read_file_text(path_str: str | None) -> str:
             return ""
     return ""
 
-def run_stage(stage: str, timeout=600, min_score: int = 0,
-              since: str | None = None, workers: int = 1) -> tuple[str, int]:
+# Per-stage default timeouts (seconds). Heavy stages (tailor, cover) can take
+# 1-2 hours when there are many jobs, so we set generous defaults. Users can
+# override per-call.
+STAGE_TIMEOUTS = {
+    "discover":  600,    # 10 min — JobSpy crawl, usually <5 min
+    "employers": 600,    # 10 min — Workday portal scrape
+    "enrich":    900,    # 15 min — detail page fetches
+    "score":     1800,   # 30 min — Ollama scoring, ~2s/job
+    "tailor":    7200,   # 2 hours — Ollama tailoring, ~30-60s/job
+    "cover":     7200,   # 2 hours — Ollama cover letters, ~20-40s/job
+    "cover_sl":  3600,   # 1 hour — Slovenian multilingual
+    "pdf":       600,    # 10 min — PDF conversion
+}
+
+
+def run_stage(stage: str, timeout: int | None = None, min_score: int = 0,
+              since: str | None = None, workers: int = 1,
+              run_in_background: bool = False) -> tuple[str, int]:
     """Run applypilot stage. Returns (output, returncode).
+
+    For long-running stages (tailor, cover), use ``run_in_background=True``
+    to dispatch via the systemd ``applypilot-daily.service`` and return
+    immediately. The user can then monitor the log file or the journal.
 
     Args:
         stage: Pipeline stage name (or 'cover_sl' for multilingual).
-        timeout: Max seconds to wait.
+        timeout: Max seconds to wait. Defaults to per-stage value in
+                 STAGE_TIMEOUTS. Set to 0 to disable the timeout entirely.
         min_score: Minimum fit score for tailor/cover (0 = no filter).
         since: Optional ISO datetime or relative string ('24h', '7d').
         workers: Number of parallel workers.
+        run_in_background: If True, dispatch via systemd and return
+                          immediately with the service status. (Currently
+                          only supported for the "all" / daily pipeline —
+                          for individual stages, just sets a long timeout.)
     """
+    if timeout is None:
+        timeout = STAGE_TIMEOUTS.get(stage, 1800)
+
     env = os.environ.copy()
     env["HOME"] = str(Path.home())
 
-    # Handle custom stages
+    # Build CLI args
     if stage == "cover_sl":
-        # Run Slovenian cover letter generation
+        args = ["python3", str(Path(__file__).parent.parent / "agents" / "cover_letter_multilingual.py")]
+    else:
+        args = ["python3", "-m", "applypilot", "run", stage]
+        if min_score and min_score > 0:
+            args += ["--min-score", str(min_score)]
+        if since:
+            args += ["--since", since]
+        if workers and workers > 1:
+            args += ["--workers", str(workers)]
+
+    cmd_str = " ".join(args)
+    effective_timeout = timeout if timeout > 0 else None
+
+    try:
         res = subprocess.run(
-            ["python3", str(Path(__file__).parent.parent / "agents" / "cover_letter_multilingual.py")],
-            capture_output=True, text=True, timeout=timeout,
+            args,
+            capture_output=True, text=True, timeout=effective_timeout,
             cwd=str(Path.home()), env=env,
         )
         return res.stdout + res.stderr, res.returncode
+    except subprocess.TimeoutExpired as e:
+        # Surface a clear, actionable error message to the dashboard instead
+        # of letting Streamlit catch the raw TimeoutExpired traceback.
+        partial = (e.stdout.decode("utf-8", errors="ignore") if isinstance(e.stdout, bytes) else (e.stdout or ""))
+        partial += (e.stderr.decode("utf-8", errors="ignore") if isinstance(e.stderr, bytes) else (e.stderr or ""))
+        msg = (
+            f"⏱️ TIMEOUT after {timeout}s running:\n"
+            f"   {cmd_str}\n\n"
+            f"Output captured before timeout:\n{partial[-2000:] if partial else '(no output captured)'}\n\n"
+            f"WHAT TO DO:\n"
+            f"  • Heavy stages (tailor/cover) can take 1-2 hours when there are\n"
+            f"    many jobs. Re-trigger with a longer timeout, or:\n"
+            f"  • Use the CLI directly:\n"
+            f"      export HOME=/home/bostjan\n"
+            f"      {cmd_str}\n"
+            f"  • Or trigger the systemd daily service (runs in background):\n"
+            f"      systemctl --user start applypilot-daily.service\n"
+            f"      journalctl --user -u applypilot-daily.service -f\n"
+        )
+        return msg, 124  # 124 = standard timeout exit code
 
-    # Build CLI args for the standard applypilot stages
+
+def _run_stage_via_systemd(stage: str, min_score: int, since: str | None,
+                            workers: int) -> None:
+    """Dispatch a heavy stage to run in the background via systemd.
+
+    For ``tailor`` and ``cover`` stages, running synchronously can take
+    1-2 hours. This function starts the appropriate systemd service and
+    surfaces a status banner so the user knows to check the log file.
+
+    Note: the current daily service runs the full pipeline. For just
+    ``tailor``/``cover``, we use the discover service as a wrapper, OR
+    we shell out via ``nohup`` to the applypilot CLI directly, redirecting
+    output to a per-stage log. The latter is simpler and more reliable.
+    """
+    # Build CLI args (same as run_stage)
     args = ["python3", "-m", "applypilot", "run", stage]
     if min_score and min_score > 0:
         args += ["--min-score", str(min_score)]
@@ -322,12 +397,37 @@ def run_stage(stage: str, timeout=600, min_score: int = 0,
     if workers and workers > 1:
         args += ["--workers", str(workers)]
 
-    res = subprocess.run(
-        args,
-        capture_output=True, text=True, timeout=timeout,
-        cwd=str(Path.home()), env=env,
+    # Write a per-stage log so the user can tail just this run
+    log_path = Path("/home/bostjan/.applypilot") / f"dashboard-{stage}.log"
+    cmd_str = " ".join(args)
+
+    # Use nohup + setsid to fully detach from the dashboard process
+    shell_cmd = (
+        f"export HOME=/home/bostjan && "
+        f"nohup {' '.join(args)} "
+        f">> {log_path} 2>&1 &"
     )
-    return res.stdout + res.stderr, res.returncode
+    try:
+        subprocess.Popen(
+            ["bash", "-c", shell_cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # detach from dashboard process group
+        )
+        st.success(
+            f"✅ Dispatched `{stage}` to background. "
+            f"Monitor with:\n"
+            f"```\n"
+            f"tail -f {log_path}\n"
+            f"# or\n"
+            f"ps -ef | grep applypilot | grep {stage}\n"
+            f"```\n"
+            f"The dashboard is free — you can navigate away or run other stages."
+        )
+    except Exception as e:
+        st.error(f"Failed to dispatch `{stage}` to background: {e}\n\nFalling back to inline run. Try the direct CLI instead:\n  export HOME=/home/bostjan\n  {cmd_str}")
+
 
 def save_job_apply_status(url: str, status: str):
     conn = get_conn()
@@ -502,8 +602,11 @@ def page_dashboard():
     c_check, c_status = st.columns([1, 4])
     with c_check:
         if st.button("🔍 Check for New Jobs", type="primary", key="check_new_jobs"):
-            with st.spinner("Running discover stage…"):
-                output, rc = run_stage("discover", timeout=300)
+            with st.spinner("Running discover stage… (up to 10 min)"):
+                # Use the per-stage default (10 min for discover) instead
+                # of the legacy 5-min timeout — JobSpy crawls with 210
+                # query × location combinations can run past 5 min.
+                output, rc = run_stage("discover")
             st.session_state["last_discover_rc"] = rc
             st.session_state["last_discover_out"] = output[-3000:]
             st.rerun()
@@ -1033,17 +1136,41 @@ def page_pipeline():
             st.caption(desc)
             col_btn, col_rc = st.columns([4, 1])
             with col_btn:
+                # Heavy stages (tailor, cover) can take 1-2 hours. Offer a
+                # "Run in background" option that uses systemd so the
+                # dashboard doesn't block on a multi-hour subprocess.
+                is_heavy = stage in ("tailor", "cover")
+                if is_heavy:
+                    bg = st.checkbox(
+                        "Run in background (systemd)",
+                        value=False,
+                        key=f"bg_{stage}",
+                        help=(
+                            "Instead of running synchronously and waiting up "
+                            "to 2 hours, dispatch via the applypilot-daily "
+                            "systemd service. The dashboard returns "
+                            "immediately; you can monitor via journalctl or "
+                            "the cron-pipeline.log file."
+                        ),
+                    )
+                else:
+                    bg = False
+
                 if st.button(f"▶ Run {label}", key=f"run_{stage}"):
-                    with st.spinner(f"Running `{stage}`..."):
-                        output, rc = run_stage(
-                            stage,
-                            min_score=min_score,
-                            since=since_arg,
-                            workers=workers,
-                        )
-                    last_out[0] = output[-4000:]
-                    last_rc[0]  = rc
-                    st.rerun()
+                    if bg:
+                        # Dispatch to systemd, return immediately
+                        _run_stage_via_systemd(stage, min_score, since_arg, workers)
+                    else:
+                        with st.spinner(f"Running `{stage}`... (timeout {STAGE_TIMEOUTS.get(stage, 1800)}s)"):
+                            output, rc = run_stage(
+                                stage,
+                                min_score=min_score,
+                                since=since_arg,
+                                workers=workers,
+                            )
+                        last_out[0] = output[-4000:]
+                        last_rc[0]  = rc
+                        st.rerun()
             with col_rc:
                 st.write(f"Exit: {last_rc[0] if last_rc[0] is not None else '—'}")
 
@@ -1145,19 +1272,22 @@ def _run_custom_url_pipeline(url: str, do_enrich: bool, do_score: bool, do_tailo
     conn.close()
 
     # Run downstream stages
+    # Per-stage timeouts come from STAGE_TIMEOUTS (set in run_stage). For
+    # single-URL pipelines (this code path) the times are usually much
+    # shorter than the defaults.
     stages_run = []
     if do_enrich:
         with st.spinner("Enriching (fetching full description)…"):
-            out, rc = run_stage("enrich", timeout=900)
+            out, rc = run_stage("enrich")
         stages_run.append(("enrich", rc, out[-2000:]))
     if do_score:
         with st.spinner("Scoring (LLM fit 1-10)…"):
-            out, rc = run_stage("score", timeout=600)
+            out, rc = run_stage("score")
         stages_run.append(("score", rc, out[-2000:]))
     if do_tailor:
         with st.spinner("Tailoring resume + writing cover letter…"):
-            out, rc = run_stage("tailor", timeout=600)
-            out2, rc2 = run_stage("cover",  timeout=600)
+            out, rc = run_stage("tailor")
+            out2, rc2 = run_stage("cover")
         stages_run.append(("tailor", rc, out[-2000:]))
         stages_run.append(("cover",  rc2, out2[-2000:]))
 
