@@ -366,19 +366,50 @@ A row is preserved from purge if **any** of these are set:
 - `applied_at IS NOT NULL` (you already submitted)
 - `approved_at IS NOT NULL` (you explicitly approved it in the Streamlit UI)
 
-### Cron Jobs (Automated)
+### Cron Jobs (Automated) — systemd timers
 
-Three cron jobs are configured to keep the pipeline running unattended:
+The pipeline runs unattended via **user-mode systemd timers** (not the legacy Hermes cron system, which had an import error that prevented the scripts from executing). Three timers cover the same schedule that the Hermes crons used to:
 
-| Schedule | What | Wrapper |
+| Schedule | Service | What it does |
 |---|---|---|
-| `0 */4 * * *` (every 4h) | `discover` only, with flock lockfile | `~/.hermes/scripts/applypilot_discover.sh` |
-| `0 20 * * *` (20:00 daily) | Full pipeline, last 24h window | `~/.hermes/scripts/applypilot_daily_pipeline.sh` |
-| `0 3 * * 6` (Sat 03:00) | Weekly purge of jobs >7 days old | `~/.hermes/scripts/applypilot_weekly_purge.sh` |
+| Every 4 hours (`00,04,08,12,16,20:00`) | `applypilot-discover.service` | `discover` stage only, with `flock` lockfile to prevent stacking |
+| Daily at 20:00 | `applypilot-daily.service` | Full pipeline (discover + enrich + score + tailor + cover), last-24h window |
+| Saturdays at 03:00 | `applypilot-weekly-purge.service` | Weekly purge of jobs >7 days old |
 
-All three log to `~/.applypilot/cron-*.log` and deliver a status summary to the chat.
+**Why systemd and not Hermes cron?** The Hermes cron "jobs" are LLM agent sessions, not dumb shell runners. An unrelated import error in Hermes's tool backend (`cannot import name 'nous_tool_gateway_unavailable_message'`) was preventing the agent from even reaching the `terminal` tool to invoke the wrapper script. systemd timers run the wrapper directly — no agent, no prompt execution, no import surface to break.
 
-To inspect or pause: use the `cronjob` tool, or `crontab -l` (the system crontab is empty — Hermes manages these).
+**Why user-mode (`--user`) and not system?** The pipeline reads `~/.applypilot/` (the user's data dir) and `~/.hermes/scripts/`. Running as the user avoids `Permission denied` errors without `sudo`. The user has `Linger=yes` so timers run even when the user isn't logged in.
+
+**Inspect and manage:**
+
+```bash
+# List all applypilot timers and their next run
+systemctl --user list-timers 'applypilot*'
+
+# Run a service right now (manual trigger — does not affect schedule)
+systemctl --user start applypilot-discover.service
+
+# Watch the live journal
+journalctl --user -u applypilot-discover.service -f
+
+# Disable a timer (e.g. when debugging)
+systemctl --user disable --now applypilot-daily.timer
+
+# Re-enable
+systemctl --user enable --now applypilot-daily.timer
+```
+
+**Files:**
+
+| Path | Purpose |
+|---|---|
+| `~/.config/systemd/user/applypilot-*.{service,timer}` | Unit files (live) |
+| `scripts/applypilot_*.sh` | Same wrappers the timers call (mirrored to the repo for version control) |
+| `~/.hermes/scripts/applypilot_*.sh` | Canonical wrappers (systemd units point here) |
+| `~/.applypilot/cron-*.log` | Per-stage log file (write-target of the wrappers) |
+| `journalctl --user -u applypilot-*` | systemd's own structured log (always preserved) |
+
+The wrapper scripts are **dual-located** — the canonical copies in `~/.hermes/scripts/` are what systemd invokes, and identical copies live in the workspace `scripts/` so they're version-controlled. The wrappers themselves are simple bash that set env vars, run a health check, then exec the applypilot CLI.
 
 ---
 

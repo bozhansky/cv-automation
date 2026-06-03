@@ -1,0 +1,14 @@
+[Unit]
+Description=ApplyPilot daily full pipeline (discover + enrich + score + tailor + cover)
+Documentation=https://github.com/bozhansky/cv-automation
+# Daily pipeline uses Ollama, so we want it running. But we don't depend on
+# it strictly because the wrapper has its own health check + early exit.
+
+[Service]
+Type=oneshot
+ExecStart=/home/bostjan/.hermes/scripts/applypilot_daily_pipeline.sh
+StandardOutput=journal
+StandardError=journal
+# Daily pipeline can run 4-6 hours if there are many new jobs.
+TimeoutStartSec=8h
+Restart=no

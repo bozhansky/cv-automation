@@ -1,0 +1,19 @@
+[Unit]
+Description=ApplyPilot periodic discover (every 4 hours)
+Documentation=https://github.com/bozhansky/cv-automation
+# We don't add After=ollama.service because discover doesn't use Ollama
+# (the AI stages — score/tailor/cover — do, but they're separate timers).
+
+[Service]
+Type=oneshot
+# Run the existing wrapper script. We keep using the wrapper rather than
+# inlining the command so any future tweaks to logging/env happen in one place.
+ExecStart=/home/bostjan/.hermes/scripts/applypilot_discover.sh
+# Keep stdout/stderr in the journal; wrapper writes to cron-discover.log too
+StandardOutput=journal
+StandardError=journal
+# Don't let a stuck discover block the next one. The wrapper already has a
+# flock lock to prevent stacking, so this is belt-and-suspenders.
+TimeoutStartSec=30min
+# If the script crashes, don't restart it in a tight loop.
+Restart=no

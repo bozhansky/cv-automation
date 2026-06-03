@@ -1,0 +1,12 @@
+[Unit]
+Description=ApplyPilot weekly purge (Saturday 03:00)
+Documentation=https://github.com/bozhansky/cv-automation
+
+[Service]
+Type=oneshot
+ExecStart=/home/bostjan/.hermes/scripts/applypilot_weekly_purge.sh
+StandardOutput=journal
+StandardError=journal
+# Purge should finish in a few minutes.
+TimeoutStartSec=1h
+Restart=no

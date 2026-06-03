@@ -1,0 +1,12 @@
+[Unit]
+Description=ApplyPilot weekly purge — Saturday 03:00
+Documentation=https://github.com/bozhansky/cv-automation
+
+[Timer]
+# Saturdays at 03:00 local time.
+OnCalendar=Sat *-*-* 03:00:00
+Persistent=true
+Unit=applypilot-weekly-purge.service
+
+[Install]
+WantedBy=timers.target

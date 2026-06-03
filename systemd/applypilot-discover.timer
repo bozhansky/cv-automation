@@ -1,0 +1,17 @@
+[Unit]
+Description=ApplyPilot periodic discover — every 4 hours
+Documentation=https://github.com/bozhansky/cv-automation
+
+[Timer]
+# Every 4 hours at minute 0 → 00:00, 04:00, 08:00, 12:00, 16:00, 20:00.
+# The 20:00 slot also runs the daily pipeline; discover is the fast
+# pre-screen for the next morning.
+OnCalendar=*-*-* 00,04,08,12,16,20:00:00
+# If the system was off at the scheduled time, run as soon as it boots.
+Persistent=true
+# Don't run immediately after a manual start (would race with the next slot).
+# (Already implicit: Persistent only catches up missed runs, not manual ones.)
+Unit=applypilot-discover.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=ApplyPilot daily full pipeline — runs at 20:00
+Documentation=https://github.com/bozhansky/cv-automation
+
+[Timer]
+# Daily at 20:00 local time. The wrapper computes "since yesterday 20:00"
+# so this processes the last 24h of new discoveries.
+OnCalendar=*-*-* 20:00:00
+Persistent=true
+Unit=applypilot-daily.service
+
+[Install]
+WantedBy=timers.target
