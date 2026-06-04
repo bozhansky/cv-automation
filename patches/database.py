@@ -658,7 +658,8 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
                      stage: str = "discovered",
                      min_score: int | None = None,
                      limit: int = 100,
-                     since: str | None = None) -> list[dict]:
+                     since: str | None = None,
+                     max_attempts: int = 5) -> list[dict]:
     """Fetch jobs filtered by pipeline stage.
 
     Args:
@@ -669,6 +670,10 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         since: ISO-8601 datetime string. If set, only jobs with
                `discovered_at >= since` are returned. Used by daily cron to
                restrict processing to a recent window (e.g. last 24h).
+        max_attempts: Cap on per-job attempt counters (tailor_attempts /
+                      cover_attempts). Jobs that have hit the cap are skipped.
+                      Only used for stages that retry on failure (currently
+                      "pending_tailor").
 
     Returns:
         List of job dicts.
@@ -684,7 +689,8 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
-            "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
+            "AND tailored_resume_path IS NULL "
+            f"AND COALESCE(tailor_attempts, 0) < {int(max_attempts)}"
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
         "pending_apply": (
